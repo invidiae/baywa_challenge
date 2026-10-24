@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+
+# Lock files from Office suites
+.~lock.*#
+
+# OS artifacts
+.DS_Store
+Thumbs.db
