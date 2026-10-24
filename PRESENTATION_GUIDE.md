@@ -39,7 +39,7 @@ As soon as the 3 uploads finish:
 ### All 3 Official Bonus Challenges Completed
 1. **Additional Meteorological Parameters (Physics Addon):** Uses ambient temperature (`°C`) and barometric air pressure (`hPa`) from Reference Park `H` to compute live air density $\rho$ via the Ideal Gas Law and applies **IEC 61400-12-1** wind speed normalization at the power curve stage.
 2. **Automatic Reference Filtering & Ranking:** Automatically detects and excludes any reference turbine that is offline (`>50%` missing) during the outage, aggregates healthy turbines by wind park (`O` and `H`), and ranks individual reference turbines by historical correlation and shared training history.
-3. **Automated Business Interruption Insurance Report:** Tab 3 generates a copy-ready formal **Insurance Claim Email / Notice** containing outage timestamps, `P50` loss (`MWh`), `95%` Coefficient CI, `P10–P90` bounds, validation error proof, and the exact mathematical transfer equation.
+3. **Automated Business Interruption Insurance Report:** Tab 3 generates a streamlined formal **Insurance Claim Email / Notice** containing only the essential claim data (outage timestamps & duration, reference turbines used, estimated `MWh` production loss, and 5-fold cross-validation error metrics) with a one-click **`✉️ Open in Default Mail App` (`mailto:`)** button.
 
 ---
 
@@ -67,7 +67,7 @@ flowchart LR
 * **Background 5-Fold Chronological Block Cross-Validation (`BayesianWindSpeedPredictor.cross_validate`):**
   * Splits all valid non-outage history into **5 contiguous chronological time blocks (Folds 1–5, ~17 days each)**.
   * Each fold is predicted strictly out-of-sample by a model trained only on the *other* 4 folds.
-  * Stitching the 5 held-out folds together produces a **100% out-of-sample cross-validated prediction series (`oof_df`)** across the entire 3-month dataset (~12,421 rows), plus a **Per-Fold Breakdown Table** in Tab 3 and out-of-fold cumulative energy error on the benchmark window (`+1.31%` on `T1`, `-3.51%` on `T2`).
+  * Stitching the 5 held-out folds together produces a **100% out-of-sample cross-validated prediction series (`oof_df`)** across the entire 3-month dataset (~12,421 rows), plus a **Per-Fold Breakdown Table** in Tab 3 and full 5-fold cross-validated cumulative energy error.
 * **What "Shared Training History" (Training Overlap) Means:** Shown in Tab 2's reference table, this is the exact count of historical 10-minute timestamps outside the Outage window where **both** the target turbine and that specific reference turbine simultaneously reported valid wind speeds (`86.3 days / 12,421 rows`).
 
 ### Process 3: Park-Level Aggregation & Always-On Wind Vector Components (`u, v`)
@@ -156,7 +156,7 @@ Every UI refinement requested for clarity and executive usability is built in:
 | **5-Fold CV `P10–P90` Coverage** | **`82.4%`** | **`82.8%`** | **`83.0%`** | Rock-solid calibration across all 5 folds (target = `80%`) |
 | **5-Fold CV Power MAE** | `492.6 kW` | `453.4 kW` | **`440.2 kW`** | Full-dataset out-of-sample 10-minute power error |
 | **5-Fold CV Power RMSE** | `770.8 kW` | `702.3 kW` | **`689.6 kW`** | Full-dataset out-of-sample 10-minute power RMSE |
-| **Out-of-Fold Benchmark Energy Error (`Sept 4–9`)** | **`+1.31%`** (`+2.79 MWh`) | **`-3.51%`** (`-10.97 MWh`) | `-11.06%` (`-30.04 MWh`) | Out-of-fold cumulative energy error on the 6-day test block |
+| **5-Fold CV Summed Energy Error** | `-12.78%` | **`-8.77%`** | `-11.35%` | Full-dataset 5-fold cross-validated cumulative energy deviation |
 
 ---
 

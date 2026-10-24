@@ -14,6 +14,7 @@ Interactive Streamlit application featuring:
 from datetime import datetime, timedelta
 import hashlib
 import io
+import urllib.parse
 from pathlib import Path
 import re
 from typing import Dict, List, Optional, Tuple
@@ -556,19 +557,9 @@ div[data-testid="stMetricValue"] {
     bt_pw_rmse = float(np.sqrt(mean_squared_error(val_act_pw, val_pred_pw)))
     bt_cov_pct = float(100.0 * np.mean((val_act_ws >= oof_df["lower"]) & (val_act_ws <= oof_df["upper"])))
 
-    # Evaluate multi-day summed Energy Yield Deviation on the benchmark validation block (out-of-fold)
-    flagged_test_mask = target_df.loc[oof_df.index, "test_set"].to_numpy(dtype=bool)
-    if int(flagged_test_mask.sum()) >= 12:
-        bench_mask = flagged_test_mask
-        bench_idx = oof_df.index[bench_mask]
-        bench_label = f"Official Benchmark Block ({bench_idx.min():%Y-%m-%d %H:%M} → {bench_idx.max():%Y-%m-%d %H:%M}, {len(bench_idx):,} intervals)"
-    else:
-        bench_mask = (oof_df["fold"] == 5).to_numpy(dtype=bool)
-        bench_idx = oof_df.index[bench_mask]
-        bench_label = f"Fold 5 Holdout Block ({bench_idx.min():%Y-%m-%d %H:%M} → {bench_idx.max():%Y-%m-%d %H:%M}, {len(bench_idx):,} intervals)"
-
-    bt_act_mwh = float(val_act_pw[bench_mask].sum() / 6000.0)
-    bt_pred_mwh = float(val_pred_pw[bench_mask].sum() / 6000.0)
+    # Compute Summed Energy Yield Error directly across the 5 cross-validation folds
+    bt_act_mwh = float(val_act_pw.sum() / 6000.0)
+    bt_pred_mwh = float(val_pred_pw.sum() / 6000.0)
     bt_dev_mwh = bt_pred_mwh - bt_act_mwh
     bt_dev_pct = float(100.0 * bt_dev_mwh / bt_act_mwh) if bt_act_mwh > 0 else float("nan")
 
@@ -581,6 +572,9 @@ div[data-testid="stMetricValue"] {
         f_pred_ws = val_pred_ws[f_mask]
         f_act_pw = val_act_pw[f_mask]
         f_pred_pw = val_pred_pw[f_mask]
+        f_act_e = float(f_act_pw.sum() / 6000.0)
+        f_pred_e = float(f_pred_pw.sum() / 6000.0)
+        f_dev_pct = float(100.0 * (f_pred_e - f_act_e) / f_act_e) if f_act_e > 0 else float("nan")
         f_cov = float(100.0 * np.mean((f_act_ws >= oof_df.loc[f_mask, "lower"]) & (f_act_ws <= oof_df.loc[f_mask, "upper"])))
         fold_rows.append(
             {
@@ -590,6 +584,7 @@ div[data-testid="stMetricValue"] {
                 "Wind MAE (m/s)": round(float(mean_absolute_error(f_act_ws, f_pred_ws)), 3),
                 "Wind RMSE (m/s)": round(float(np.sqrt(mean_squared_error(f_act_ws, f_pred_ws))), 3),
                 "Power MAE (kW)": round(float(mean_absolute_error(f_act_pw, f_pred_pw)), 1),
+                "Summed Energy Error (%)": f"{f_dev_pct:+.2f}%",
                 "80% Band Coverage": f"{f_cov:.1f}%",
             }
         )
@@ -1032,7 +1027,7 @@ div[data-testid="stMetricValue"] {
 * **What this gives you:**  
   Every single non-outage timestamp in your dataset is evaluated **strictly out-of-sample**, producing rock-solid accuracy metrics across all ~86 days without ever shrinking the training dataset or changing your headline Outage Energy Loss!
 * **MAE & RMSE:** Typical 10-minute wind (`m/s`) and power (`kW`) error across all 5 out-of-sample folds.
-* **Out-of-Fold Benchmark Energy Error (%):** Compares out-of-fold predicted `MWh` against actual `MWh` over the multi-day benchmark block (`0%` = spot-on cumulative energy).
+* **5-Fold Cross-Validation Summed Energy Yield Error (%):** Compares the total out-of-fold predicted `MWh` against actual `MWh` across the 5 cross-validation folds.
 """
             )
 
@@ -1045,33 +1040,29 @@ div[data-testid="stMetricValue"] {
                     {"Metric": "5-Fold CV Wind Speed R²", "Value": f"{bt_ws_r2:.3f}", "Plain-English Meaning": f"Out-of-sample model explains {bt_ws_r2 * 100:.1f}% of wind speed variance"},
                     {"Metric": "5-Fold CV Power MAE", "Value": f"{bt_pw_mae:.1f} kW", "Plain-English Meaning": "Average out-of-sample 10-minute electrical power error across all 5 folds"},
                     {"Metric": "5-Fold CV Power RMSE", "Value": f"{bt_pw_rmse:.1f} kW", "Plain-English Meaning": "Out-of-sample 10-minute power RMSE across all 5 folds"},
+                    {"Metric": "5-Fold CV Actual vs. Predicted MWh", "Value": f"{bt_act_mwh:,.2f} MWh vs. {bt_pred_mwh:,.2f} MWh", "Plain-English Meaning": f"Net difference of {bt_dev_mwh:+,.2f} MWh across all 5 cross-validation folds"},
+                    {"Metric": "5-Fold CV Summed Energy Yield Error (%)", "Value": f"{bt_dev_pct:+.2f}%", "Plain-English Meaning": "Cumulative percentage difference between predicted and actual energy across all 5 folds"},
                     {"Metric": "5-Fold CV 80% Band Coverage (P10–P90)", "Value": f"{bt_cov_pct:.1f}%", "Plain-English Meaning": "Share of real 10-min wind readings falling inside our 80% band across all 5 folds (ideal = 80%)"},
-                    {"Metric": "Benchmark Block Actual vs. Out-of-Fold MWh", "Value": f"{bt_act_mwh:.2f} MWh vs. {bt_pred_mwh:.2f} MWh", "Plain-English Meaning": f"Net difference of {bt_dev_mwh:+.2f} MWh on {bench_label}"},
-                    {"Metric": "Out-of-Fold Summed Energy Yield Error (%)", "Value": f"{bt_dev_pct:+.2f}%", "Plain-English Meaning": f"Cumulative energy error on {bench_label}"},
                 ]
             )
             st.dataframe(scorecard_df, hide_index=True, width="stretch")
             st.markdown("#### Per-Fold Chronological Cross-Validation Breakdown")
             st.dataframe(fold_summary_df, hide_index=True, width="stretch")
         else:
-            st.warning(
-                "The currently selected Validation Period contains fewer than 2 measured target wind speeds "
-                "(for example, it overlaps missing outage rows). Adjust **3. Validation Period** in the sidebar to dates where real measurements exist."
-            )
+            st.warning("Insufficient non-outage measurements to run 5-fold cross-validation.")
 
         st.markdown("---")
         st.subheader("📨 Insurance Claim Summary & Settlement Notice")
-        with st.expander("Preview Formal Business Interruption Insurance Claim Notice", expanded=False):
+        with st.expander("Preview Formal Business Interruption Insurance Claim Notice", expanded=True):
             hours = len(outage_idx) / 6.0
             val_line = (
-                f"{bt_dev_pct:+.2f}% ({bt_pred_mwh:.2f} MWh predicted vs. {bt_act_mwh:.2f} MWh actual)"
+                f"{bt_dev_pct:+.2f}% ({bt_pred_mwh:,.2f} MWh predicted vs. {bt_act_mwh:,.2f} MWh actual across 5 cross-validation folds)"
                 if has_valid_backtest
-                else "N/A (no measured validation window selected)"
+                else "N/A"
             )
             ws_line = f"{bt_ws_rmse:.3f} m/s / {bt_ws_mae:.3f} m/s" if has_valid_backtest else "N/A"
-            claim_text = f"""Subject: Business Interruption Insurance Claim Notice - Turbine {target_name} Outage
-
-To: Claims Adjustment Team (Renewable Energy Business Interruption Division)
+            claim_subject = f"Business Interruption Insurance Claim Notice - Turbine {target_name} Outage ({outage_start:%Y-%m-%d})"
+            claim_body = f"""To: Claims Adjustment Team (Renewable Energy Business Interruption Division)
 From: Asset Operations & Yield Management (BayWa r.e.)
 Date: {pd.Timestamp.now():%d %B %Y}
 
@@ -1084,32 +1075,41 @@ POLICY ID: WIND-ALL-RISK-2026-EU
 * Outage End:   {outage_end:%Y-%m-%d %H:%M} (Berlin / Germany Time)
 * Total Duration: {hours:.1f} Operating Hours ({len(outage_idx)} consecutive 10-minute intervals)
 
-2. COUNTERFACTUAL LOSS ADJUSTMENT (IEC 61400 COMPLIANT)
+2. COUNTERFACTUAL LOSS SUMMARY
 * Reference Turbines Utilized: {', '.join(active_refs.keys())}
-* Methodology: Park-aggregated Bayesian Ridge Regression with permanent directional vectors (u, v).
-* Closed-Form Transfer Equation: {predictor.get_formula()}
-* Atmospheric Correction: IEC 61400-12-1 Air Density Normalization ({'Enabled' if use_density else 'Disabled'}).
+* Estimated Energy Production Loss: {loss_p50_mwh:,.2f} MWh
+* Mean Counterfactual Power Output: {pw_p50_kw.mean():,.1f} kW
 
-ESTIMATED PRODUCTION LOSS SUMMARY (MWh):
-* Central Loss Estimate (P50):             {loss_p50_mwh:,.2f} MWh
-* 95% Coefficient Confidence Interval:     {loss_coef_lo_mwh:,.2f} MWh to {loss_coef_hi_mwh:,.2f} MWh
-* 80% Bayesian Predictive Band (P10–P90):  {loss_p10_mwh:,.2f} MWh to {loss_p90_mwh:,.2f} MWh
-* Outage Mean Lost Power:                  {pw_p50_kw.mean():,.1f} kW
-
-3. AUDIT TRAIL & VALIDATION
-* Unseen Validation Summed Energy Error: {val_line}
-* Unseen Validation Wind RMSE / MAE:     {ws_line}
+3. 5-FOLD CROSS-VALIDATION AUDIT METRICS
+* Unseen Validation Summed Energy Error (5-Fold CV): {val_line}
+* Unseen Validation Wind RMSE / MAE (5-Fold CV):     {ws_line}
 
 Authorized Signature:
 Asset Performance & Risk Engineering Team, BayWa r.e.
 """
-            st.text_area("Generated Claim Notice", claim_text, height=320)
-            st.download_button(
-                "Download Claim Notice (.txt)",
-                data=claim_text,
-                file_name=f"insurance_claim_{target_name}_{outage_start:%Y%m%d}.txt",
-                mime="text/plain",
+            claim_text = f"Subject: {claim_subject}\n\n{claim_body}"
+            mailto_url = (
+                f"mailto:?subject={urllib.parse.quote(claim_subject)}"
+                f"&body={urllib.parse.quote(claim_body)}"
             )
+            st.text_area("Generated Claim Notice", claim_text, height=300)
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                st.link_button(
+                    "✉️ Open in Default Mail App",
+                    mailto_url,
+                    type="primary",
+                    width="stretch",
+                    help="Opens your computer's default email client with the Subject and Claim Notice body pre-filled.",
+                )
+            with btn_col2:
+                st.download_button(
+                    "💾 Download Claim Notice (.txt)",
+                    data=claim_text,
+                    file_name=f"insurance_claim_{target_name}_{outage_start:%Y%m%d}.txt",
+                    mime="text/plain",
+                    width="stretch",
+                )
 
     # ==================== TAB 4 ====================
     with tab4:
