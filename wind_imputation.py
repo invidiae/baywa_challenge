@@ -15,6 +15,50 @@ class ImputationResult:
     test: pd.DataFrame; outage: pd.DataFrame; metrics: dict[str, float]
     selected_model: str; cv_scores: dict[str, float]; interval_minutes: float
 
+def apply_physics_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Append IEC-aligned atmospheric and wake-aware SCADA features.
+
+    Parameters
+    ----------
+    df:
+        A DataFrame with ``wind_speed`` (m/s), ``wind_direction`` (degrees),
+        ``temperature`` (degrees C), and ``pressure`` (hPa or mbar). Rows are
+        assumed to be ordered chronologically at the usual 10-minute cadence.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of the input with air density, density-normalised wind speed,
+        cyclical direction terms, the 250-290 degree wake-sector indicator,
+        and a six-period (one-hour) wind-speed rolling standard deviation.
+
+    Notes
+    -----
+    The air-density calculation follows the requested dry-air ideal-gas form
+    used in IEC 61400-12-1-style normalisation. The initial rolling-standard-
+    deviation value is set to zero because no prior 10-minute observation
+    exists from which to estimate turbulence.
+    """
+    required = {"wind_speed", "wind_direction", "temperature", "pressure"}
+    if missing := required - set(df.columns):
+        raise ValueError(f"Missing physics input columns: {sorted(missing)}")
+
+    result = df.copy()
+    wind_speed = pd.to_numeric(result["wind_speed"], errors="coerce")
+    direction = pd.to_numeric(result["wind_direction"], errors="coerce") % 360.0
+    temperature_kelvin = pd.to_numeric(result["temperature"], errors="coerce") + 273.15
+    pressure_pa = pd.to_numeric(result["pressure"], errors="coerce") * 100.0
+
+    # rho = p / (R_specific * T), with R_specific for dry air in J/(kg K).
+    result["air_density_kg_m3"] = pressure_pa / (287.05 * temperature_kelvin)
+    result["normalized_wind_speed"] = wind_speed * (result["air_density_kg_m3"] / 1.225) ** (1.0 / 3.0)
+    radians = np.deg2rad(direction)
+    result["sin_wind_dir"] = np.sin(radians)
+    result["cos_wind_dir"] = np.cos(radians)
+    result["is_wake_sector"] = direction.between(250.0, 290.0, inclusive="both").astype(float)
+    result["wind_speed_rolling_std_1h"] = wind_speed.rolling(window=6, min_periods=1).std(ddof=0).fillna(0.0)
+    return result
+
 def load_scada(upload: Any) -> pd.DataFrame:
     """Read CSV/XLSX SCADA and preserve missing wind speeds as outage candidates."""
     name = str(getattr(upload, "name", upload)).lower()
