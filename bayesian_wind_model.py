@@ -6,11 +6,12 @@ from reference wind farms (Park O and Park H) using Bayesian Linear Regression.
 
 Stage 2 (Integrated): The predicted wind speeds are subsequently mapped through
 the manufacturer power curve (speed_to_power.py) to calculate electrical power
-generation (kW) and energy yield loss (kWh / MWh).
+generation (kW) and energy yield loss (kWh / MWh), with optional IEC 61400-12-1
+air density correction.
 
 Why Bayesian Ridge?
 1. 100% Explainable: Yields a single, transparent mathematical formula per turbine:
-   v_T = w_0 + w_1 * v_O + w_2 * v_H + w_3 * u_dir + w_4 * v_dir
+   v_T = w_0 + w_1 * v_O + w_2 * v_H + w_3 * u_O + w_4 * v_O + w_5 * u_H + w_6 * v_H
 2. Exact Analytical Uncertainty: Estimates posterior distribution N(mu, sigma^2)
    giving closed-form, monotonic quantiles (P10, P50, P90) with zero quantile crossing.
 3. Regularized & Robust: Hyperparameters (alpha, lambda) are automatically learned
@@ -177,6 +178,8 @@ class BayesianWindSpeedPredictor:
 def evaluate_bayesian_pipeline(
     target_name: str,
     data_dir: Union[str, Path] = "data",
+    include_direction: bool = True,
+    apply_density_correction: bool = False,
 ) -> Dict[str, Any]:
     """
     Run chronological training and evaluation on the official shown validation window
@@ -184,7 +187,15 @@ def evaluate_bayesian_pipeline(
     """
     data_dir = Path(data_dir)
     target_df = load_turbine_scada(data_dir / f"{target_name}_data.xlsx").set_index("timestamp")
-    features = build_reference_features(data_dir=data_dir)
+    all_features = build_reference_features(data_dir=data_dir)
+
+    # Feature selection based on directional toggle
+    feature_cols = (
+        ["speed_O", "speed_H", "u_O", "v_O", "u_H", "v_H"]
+        if include_direction
+        else ["speed_O", "speed_H"]
+    )
+    features = all_features[feature_cols]
 
     common_idx = target_df.index.intersection(features.index)
     target_df = target_df.loc[common_idx]
@@ -211,13 +222,19 @@ def evaluate_bayesian_pipeline(
     power_curve = PowerCurveModel.from_excel(data_dir / f"{target_name}_power_curve.xlsx", sheet_name=target_name)
 
     actual_power_kw = power_curve.predict_power(y_val_speed)
-    loss_quantiles = power_curve.estimate_outage_loss_quantiles(
-        speed_quantiles,
-        timestamps=target_df.loc[val_mask].index,
-        interval_minutes=10.0,
-    )
+    p50_speed_val = speed_quantiles["q50"].to_numpy(dtype=float)
 
-    pred_p50_kw = loss_quantiles["power_kw"]["power_kw_q50"].to_numpy(dtype=float)
+    if apply_density_correction:
+        # IEC 61400-12-1: v_norm = v * (rho / rho_0)^(1/3)
+        val_pressure_pa = target_df.loc[val_mask, "air_pressure"].to_numpy(dtype=float) * 100.0
+        val_temp_k = target_df.loc[val_mask, "ambient_temperature"].to_numpy(dtype=float) + 273.15
+        rho = val_pressure_pa / (287.05 * val_temp_k)
+        density_factor = (rho / 1.225) ** (1.0 / 3.0)
+        p50_speed_effective = p50_speed_val * density_factor
+    else:
+        p50_speed_effective = p50_speed_val
+
+    pred_p50_kw = power_curve.predict_power(p50_speed_effective)
     mae_power = float(np.mean(np.abs(pred_p50_kw - actual_power_kw)))
     rmse_power = float(np.sqrt(np.mean((pred_p50_kw - actual_power_kw) ** 2)))
 
@@ -227,11 +244,12 @@ def evaluate_bayesian_pipeline(
 
     return {
         "target": target_name,
+        "include_direction": include_direction,
+        "apply_density_correction": apply_density_correction,
         "predictor": predictor,
         "formula": predictor.get_formula(),
         "feature_table": predictor.get_feature_table(),
         "speed_quantiles": speed_quantiles,
-        "loss_quantiles": loss_quantiles,
         "metrics": {
             "val_samples": int(val_mask.sum()),
             "speed_mae_mps": round(mae_speed, 3),
@@ -247,36 +265,49 @@ def evaluate_bayesian_pipeline(
     }
 
 
+def run_direction_ablation_study(data_dir: Union[str, Path] = "data") -> pd.DataFrame:
+    """Run full comparative study comparing model performance without vs with wind direction."""
+    records = []
+    for target in ["T1", "T2", "T3"]:
+        res_no = evaluate_bayesian_pipeline(target, data_dir=data_dir, include_direction=False)
+        res_dir = evaluate_bayesian_pipeline(target, data_dir=data_dir, include_direction=True)
+
+        m_no = res_no["metrics"]
+        m_dir = res_dir["metrics"]
+
+        records.append({
+            "Turbine": target,
+            "Speed MAE (No Dir)": m_no["speed_mae_mps"],
+            "Speed MAE (With Dir)": m_dir["speed_mae_mps"],
+            "Delta Speed MAE": round(m_dir["speed_mae_mps"] - m_no["speed_mae_mps"], 3),
+            "Power MAE (No Dir)": m_no["power_mae_kw"],
+            "Power MAE (With Dir)": m_dir["power_mae_kw"],
+            "Delta Power MAE (kW)": round(m_dir["power_mae_kw"] - m_no["power_mae_kw"], 1),
+            "Energy Dev (No Dir) %": m_no["energy_deviation_pct"],
+            "Energy Dev (With Dir) %": m_dir["energy_deviation_pct"],
+            "Abs Dev Improvement %": round(abs(m_no["energy_deviation_pct"]) - abs(m_dir["energy_deviation_pct"]), 2),
+        })
+
+    return pd.DataFrame(records)
+
+
 def main():
     print("=" * 80)
     print(" BAYESIAN RIDGE WIND SPEED PREDICTION & EXPLAINABLE POWER EVALUATION")
     print("=" * 80)
 
-    summary_rows = []
-
     for target in ["T1", "T2", "T3"]:
-        res = evaluate_bayesian_pipeline(target)
-        m = res["metrics"]
-        summary_rows.append({
-            "Turbine": target,
-            "Speed MAE (m/s)": m["speed_mae_mps"],
-            "Speed RMSE (m/s)": m["speed_rmse_mps"],
-            "Speed R^2": m["speed_r2"],
-            "P10-P90 Cov (%)": m["p10_p90_coverage_pct"],
-            "Power MAE (kW)": m["power_mae_kw"],
-            "Power RMSE (kW)": m["power_rmse_kw"],
-            "Energy Dev (%)": m["energy_deviation_pct"],
-        })
-
-        print(f"\n[{target}] Explainable Closed-Form Formula:")
+        res = evaluate_bayesian_pipeline(target, include_direction=True)
+        print(f"\n[{target}] Explainable Closed-Form Formula (with Direction):")
         print("  " + res["formula"])
         print("\nFeature Weights:")
         print(res["feature_table"].to_string(index=False))
         print("-" * 80)
 
-    summary_df = pd.DataFrame(summary_rows)
-    print("\nSUMMARY METRICS ON OFFICIAL VALIDATION WINDOW (Sept 4 - Sept 9, 2026):")
-    print(summary_df.to_string(index=False))
+    print("\nWIND DIRECTION ABLATION STUDY (Validation Window: Sept 4 - Sept 9, 2026):")
+    print("=" * 80)
+    ablation_df = run_direction_ablation_study()
+    print(ablation_df.to_string(index=False))
 
 
 if __name__ == "__main__":
