@@ -1,14 +1,14 @@
 """
 BayWa r.e. Wind Turbine Outage Energy Loss Estimator
 ====================================================
-Interactive Streamlit application powered by:
+Interactive Streamlit application featuring:
 1. Manual Excel / CSV upload workflow for Target, Reference(s), and Power Curve.
-2. Explainable Bayesian Ridge Regression with always-on directional vectors (u, v),
-   posterior 95% coefficient confidence intervals, and full Bayesian predictive bands.
-3. IEC 61400-12-1 Air Density Normalization from reference pressure & temperature.
-4. Synchronized Manual Calendar/Time Entry + Range Slider for the outage period.
-5. Dedicated 4th Tab for 10-minute interval predictions with interactive symmetric
-   percentile certainty slider (50%–99%) and MWh-standardized energy accounting.
+2. Prominent Main-Page Energy Loss (MWh) Executive Summary above all tabs.
+3. Explainable Bayesian Ridge Regression with permanent directional vectors (u, v),
+   posterior 95% coefficient confidence intervals, and full P10–P90 predictive bands.
+4. Synchronized Manual Calendar/Time Entry + Sliders for BOTH Outage & Validation periods.
+5. Plain-English expandable (?) guides and tooltips throughout the interface.
+6. Dedicated 4th Tab for 10-minute interval predictions with symmetric certainty slider.
 """
 
 from datetime import datetime, timedelta
@@ -30,6 +30,9 @@ from bayesian_wind_model import (
     compute_air_density_from_frames,
 )
 from speed_to_power import PowerCurveModel
+
+
+PLOTLY_FONT = dict(size=14, color="#1e293b")
 
 
 # ---------------- Cached Upload Parsers & Helpers ----------------
@@ -168,6 +171,89 @@ def clamp_timestamp(ts: pd.Timestamp, lo: pd.Timestamp, hi: pd.Timestamp) -> pd.
     return max(lo, min(hi, ts))
 
 
+def _bind_datetime_window(
+    prefix: str,
+    default_start: pd.Timestamp,
+    default_end: pd.Timestamp,
+    min_ts: pd.Timestamp,
+    max_ts: pd.Timestamp,
+    slider_label: str,
+    reset_label: Optional[str] = None,
+) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """Render synchronized Calendar Date/Time inputs + Range Slider in the sidebar."""
+    k_win = f"{prefix}_win"
+    k_sd, k_st = f"{prefix}_sd", f"{prefix}_st"
+    k_ed, k_et = f"{prefix}_ed", f"{prefix}_et"
+    k_sl = f"{prefix}_sl"
+
+    if k_win not in st.session_state:
+        pair = (default_start.to_pydatetime(), default_end.to_pydatetime())
+        st.session_state[k_win] = pair
+        st.session_state[k_sl] = pair
+        st.session_state[k_sd] = default_start.date()
+        st.session_state[k_st] = default_start.time().replace(second=0, microsecond=0)
+        st.session_state[k_ed] = default_end.date()
+        st.session_state[k_et] = default_end.time().replace(second=0, microsecond=0)
+
+    def _from_cal() -> None:
+        s_dt = clamp_timestamp(
+            pd.Timestamp(datetime.combine(st.session_state[k_sd], st.session_state[k_st])),
+            min_ts,
+            max_ts,
+        ).floor("10min")
+        e_dt = clamp_timestamp(
+            pd.Timestamp(datetime.combine(st.session_state[k_ed], st.session_state[k_et])),
+            min_ts,
+            max_ts,
+        ).floor("10min")
+        if e_dt < s_dt:
+            e_dt = s_dt
+        pair = (s_dt.to_pydatetime(), e_dt.to_pydatetime())
+        st.session_state[k_win] = pair
+        st.session_state[k_sl] = pair
+        st.session_state[k_sd], st.session_state[k_st] = s_dt.date(), s_dt.time()
+        st.session_state[k_ed], st.session_state[k_et] = e_dt.date(), e_dt.time()
+
+    def _from_sl() -> None:
+        s_py, e_py = st.session_state[k_sl]
+        s_dt = pd.Timestamp(s_py).floor("10min")
+        e_dt = pd.Timestamp(e_py).floor("10min")
+        st.session_state[k_win] = (s_dt.to_pydatetime(), e_dt.to_pydatetime())
+        st.session_state[k_sd], st.session_state[k_st] = s_dt.date(), s_dt.time()
+        st.session_state[k_ed], st.session_state[k_et] = e_dt.date(), e_dt.time()
+
+    def _reset() -> None:
+        pair = (default_start.to_pydatetime(), default_end.to_pydatetime())
+        st.session_state[k_win] = pair
+        st.session_state[k_sl] = pair
+        st.session_state[k_sd] = default_start.date()
+        st.session_state[k_st] = default_start.time().replace(second=0, microsecond=0)
+        st.session_state[k_ed] = default_end.date()
+        st.session_state[k_et] = default_end.time().replace(second=0, microsecond=0)
+
+    c_sd, c_st = st.sidebar.columns([1.25, 1.0])
+    c_sd.date_input("Start Date", min_value=min_ts.date(), max_value=max_ts.date(), key=k_sd, on_change=_from_cal)
+    c_st.time_input("Start Time", step=timedelta(minutes=10), key=k_st, on_change=_from_cal)
+
+    c_ed, c_et = st.sidebar.columns([1.25, 1.0])
+    c_ed.date_input("End Date", min_value=min_ts.date(), max_value=max_ts.date(), key=k_ed, on_change=_from_cal)
+    c_et.time_input("End Time", step=timedelta(minutes=10), key=k_et, on_change=_from_cal)
+
+    st.sidebar.slider(
+        slider_label,
+        min_value=min_ts.to_pydatetime(),
+        max_value=max_ts.to_pydatetime(),
+        step=timedelta(minutes=10),
+        format="DD MMM HH:mm",
+        key=k_sl,
+        on_change=_from_sl,
+    )
+    if reset_label:
+        st.sidebar.button(reset_label, on_click=_reset, width="stretch", key=f"{prefix}_reset_btn")
+
+    return pd.Timestamp(st.session_state[k_win][0]), pd.Timestamp(st.session_state[k_win][1])
+
+
 # ---------------- Main Streamlit App ----------------
 def render_app() -> None:
     st.set_page_config(
@@ -176,6 +262,7 @@ def render_app() -> None:
         layout="wide",
     )
 
+    # Hide Deploy button + enlarge small fonts across captions, labels, tabs, expanders, and sidebar
     st.markdown(
         """
 <style>
@@ -186,26 +273,69 @@ def render_app() -> None:
     display: none !important;
     visibility: hidden !important;
 }
+html, body, [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {
+    font-size: 1.05rem;
+    line-height: 1.55;
+}
+[data-testid="stCaptionContainer"] p, .stCaption {
+    font-size: 0.96rem !important;
+    color: #334155 !important;
+    line-height: 1.45 !important;
+}
+[data-testid="stWidgetLabel"] p {
+    font-size: 0.98rem !important;
+    font-weight: 500 !important;
+}
+button[data-baseweb="tab"] p {
+    font-size: 1.06rem !important;
+    font-weight: 600 !important;
+}
+[data-testid="stExpander"] summary p {
+    font-size: 1.04rem !important;
+    font-weight: 600 !important;
+}
 .hero {
     background: linear-gradient(90deg, #0b3d91, #1a73e8);
     padding: 22px 28px;
     border-radius: 12px;
     color: white;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
 }
-.hero h1 { margin: 0; font-size: 2.0rem; color: white; }
-.hero p { margin: 6px 0 0 0; opacity: 0.92; font-size: 1.02rem; }
+.hero h1 { margin: 0; font-size: 2.05rem; color: white; }
+.hero p { margin: 6px 0 0 0; opacity: 0.95; font-size: 1.08rem; }
+.loss-banner {
+    background: linear-gradient(135deg, #eff6ff 0%, #f8fafc 100%);
+    border: 1.5px solid #bfdbfe;
+    border-left: 6px solid #1d4ed8;
+    padding: 14px 20px;
+    border-radius: 12px;
+    margin-bottom: 10px;
+}
+.loss-banner h3 {
+    margin: 0 0 2px 0;
+    font-size: 1.2rem;
+    color: #1e3a8a;
+}
 div[data-testid="stMetric"] {
     background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    padding: 12px 16px;
+    border: 1px solid #cbd5e1;
+    padding: 14px 18px;
     border-radius: 10px;
 }
-div[data-testid="stMetric"] * { color: #0f172a !important; }
+div[data-testid="stMetricLabel"] p {
+    font-size: 0.98rem !important;
+    font-weight: 600 !important;
+    color: #1e293b !important;
+}
+div[data-testid="stMetricValue"] {
+    font-size: 1.7rem !important;
+    font-weight: 700 !important;
+    color: #0f172a !important;
+}
 </style>
 <div class="hero">
   <h1>🌬️ Wind Farm Outage: Energy Loss Estimator</h1>
-  <p>Bayesian Ridge Wind Transfer with Coefficient Confidence Intervals & IEC 61400-12-1 Normalization</p>
+  <p>Bayesian Ridge Wind Transfer · Coefficient Confidence Intervals · IEC 61400-12-1 Air Density Physics</p>
 </div>
 """,
         unsafe_allow_html=True,
@@ -213,25 +343,28 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
 
     # ---------------- Sidebar: 1. File Uploads ----------------
     st.sidebar.header("1. Upload SCADA & Curve Files")
-    st.sidebar.caption("Upload Excel (.xlsx/.xls) or CSV files for Target (e.g. T1–T3), References (e.g. O1–O2, H1–H5), and Power Curve.")
+    st.sidebar.caption("Upload Excel (.xlsx/.xls) or CSV files for Target (T1–T3), References (O1–O2, H1–H5), and Power Curve.")
 
     target_upload = st.sidebar.file_uploader(
         "Target Turbine SCADA (e.g. T1–T3)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=False,
         key="uploader_target",
+        help="Upload the affected wind turbine file whose missing outage period you want to estimate.",
     )
     reference_uploads = st.sidebar.file_uploader(
         "Reference Turbine SCADA (e.g. O1–O2, H1–H5)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         key="uploader_refs",
+        help="Upload one or more neighbouring turbines that stayed online during the outage.",
     )
     curve_upload = st.sidebar.file_uploader(
         "Target Turbine Power Curve",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=False,
         key="uploader_curve",
+        help="Upload the manufacturer power curve mapping wind speed (m/s) to active electrical power (kW).",
     )
 
     if not target_upload or not reference_uploads or not curve_upload:
@@ -275,101 +408,66 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
         st.stop()
         return
 
-    # ---------------- Sidebar: 2. Outage Period (Manual Calendar + Slider) ----------------
+    min_ts = target_df.index.min()
+    max_ts = target_df.index.max()
+    sig = hashlib.md5(f"{target_upload.name}_{len(target_df)}_{min_ts}_{max_ts}".encode()).hexdigest()[:8]
+
+    # ---------------- Sidebar: 2. Outage Period ----------------
+    st.sidebar.markdown("---")
     st.sidebar.header("2. Outage Period")
 
     nan_in_test = target_df.loc[target_df["test_set"], "wind_speed"]
     auto_outage = find_longest_nan_run(nan_in_test) or find_longest_nan_run(target_df["wind_speed"])
 
-    min_ts = target_df.index.min()
-    max_ts = target_df.index.max()
-
     if auto_outage:
-        default_start, default_end = auto_outage[0], auto_outage[1]
+        out_def_start, out_def_end = auto_outage[0], auto_outage[1]
         st.sidebar.success(
-            f"Auto-detected missing data:\n**{default_start:%Y-%m-%d %H:%M}** → **{default_end:%Y-%m-%d %H:%M}**"
+            f"Auto-detected outage:\n**{out_def_start:%Y-%m-%d %H:%M}** → **{out_def_end:%Y-%m-%d %H:%M}**"
         )
     else:
-        default_end = max_ts
-        default_start = max(min_ts, max_ts - timedelta(days=3))
-        st.sidebar.warning("No NaN gap detected in target file; defaulting to final 3 days.")
+        out_def_end = max_ts
+        out_def_start = max(min_ts, max_ts - timedelta(days=3))
+        st.sidebar.warning("No missing wind gap found; defaulting to final 3 days.")
 
-    sig = hashlib.md5(f"{target_upload.name}_{len(target_df)}_{min_ts}_{max_ts}".encode()).hexdigest()[:8]
-    k_win = f"win_{sig}"
-    k_sd, k_st = f"sd_{sig}", f"st_{sig}"
-    k_ed, k_et = f"ed_{sig}", f"et_{sig}"
-    k_sl = f"sl_{sig}"
-
-    if k_win not in st.session_state:
-        st.session_state[k_win] = (default_start.to_pydatetime(), default_end.to_pydatetime())
-        st.session_state[k_sd] = default_start.date()
-        st.session_state[k_st] = default_start.time().replace(second=0, microsecond=0)
-        st.session_state[k_ed] = default_end.date()
-        st.session_state[k_et] = default_end.time().replace(second=0, microsecond=0)
-        st.session_state[k_sl] = (default_start.to_pydatetime(), default_end.to_pydatetime())
-
-    def _sync_from_calendar() -> None:
-        s_dt = clamp_timestamp(
-            pd.Timestamp(datetime.combine(st.session_state[k_sd], st.session_state[k_st])),
-            min_ts,
-            max_ts,
-        ).floor("10min")
-        e_dt = clamp_timestamp(
-            pd.Timestamp(datetime.combine(st.session_state[k_ed], st.session_state[k_et])),
-            min_ts,
-            max_ts,
-        ).floor("10min")
-        if e_dt < s_dt:
-            e_dt = s_dt
-        pair = (s_dt.to_pydatetime(), e_dt.to_pydatetime())
-        st.session_state[k_win] = pair
-        st.session_state[k_sl] = pair
-        st.session_state[k_sd], st.session_state[k_st] = s_dt.date(), s_dt.time()
-        st.session_state[k_ed], st.session_state[k_et] = e_dt.date(), e_dt.time()
-
-    def _sync_from_slider() -> None:
-        s_py, e_py = st.session_state[k_sl]
-        s_dt = pd.Timestamp(s_py).floor("10min")
-        e_dt = pd.Timestamp(e_py).floor("10min")
-        st.session_state[k_win] = (s_dt.to_pydatetime(), e_dt.to_pydatetime())
-        st.session_state[k_sd], st.session_state[k_st] = s_dt.date(), s_dt.time()
-        st.session_state[k_ed], st.session_state[k_et] = e_dt.date(), e_dt.time()
-
-    def _reset_to_auto() -> None:
-        pair = (default_start.to_pydatetime(), default_end.to_pydatetime())
-        st.session_state[k_win] = pair
-        st.session_state[k_sl] = pair
-        st.session_state[k_sd] = default_start.date()
-        st.session_state[k_st] = default_start.time().replace(second=0, microsecond=0)
-        st.session_state[k_ed] = default_end.date()
-        st.session_state[k_et] = default_end.time().replace(second=0, microsecond=0)
-
-    st.sidebar.markdown("**Manual Calendar & Time Entry**")
-    c_sd, c_st = st.sidebar.columns([1.25, 1.0])
-    c_sd.date_input("Start Date", min_value=min_ts.date(), max_value=max_ts.date(), key=k_sd, on_change=_sync_from_calendar)
-    c_st.time_input("Start Time", step=timedelta(minutes=10), key=k_st, on_change=_sync_from_calendar)
-
-    c_ed, c_et = st.sidebar.columns([1.25, 1.0])
-    c_ed.date_input("End Date", min_value=min_ts.date(), max_value=max_ts.date(), key=k_ed, on_change=_sync_from_calendar)
-    c_et.time_input("End Time", step=timedelta(minutes=10), key=k_et, on_change=_sync_from_calendar)
-
-    st.sidebar.slider(
-        "Or Drag Outage Window",
-        min_value=min_ts.to_pydatetime(),
-        max_value=max_ts.to_pydatetime(),
-        step=timedelta(minutes=10),
-        format="DD MMM HH:mm",
-        key=k_sl,
-        on_change=_sync_from_slider,
+    outage_start, outage_end = _bind_datetime_window(
+        prefix=f"out_{sig}",
+        default_start=out_def_start,
+        default_end=out_def_end,
+        min_ts=min_ts,
+        max_ts=max_ts,
+        slider_label="Or Drag Outage Window",
+        reset_label="↺ Reset to Auto-Detected Outage" if auto_outage else None,
     )
-
-    if auto_outage:
-        st.sidebar.button("↺ Reset to Auto-Detected Outage", on_click=_reset_to_auto, width="stretch")
-
-    outage_start = pd.Timestamp(st.session_state[k_win][0])
-    outage_end = pd.Timestamp(st.session_state[k_win][1])
     outage_mask = (target_df.index >= outage_start) & (target_df.index <= outage_end)
     outage_idx = target_df.index[outage_mask]
+
+    # ---------------- Sidebar: 3. Validation Period (Manually Adjustable!) ----------------
+    st.sidebar.markdown("---")
+    st.sidebar.header("3. Validation Period")
+    st.sidebar.caption(
+        "Known historical window held out from training so we can verify accuracy against real measurements."
+    )
+
+    default_outage_mask = (target_df.index >= out_def_start) & (target_df.index <= out_def_end)
+    flagged_val_idx = target_df.index[(~default_outage_mask) & target_df["test_set"] & target_df["wind_speed"].notna()]
+    if len(flagged_val_idx) >= 12:
+        val_def_start, val_def_end = flagged_val_idx.min(), flagged_val_idx.max()
+    else:
+        obs_non_out = target_df.index[(~default_outage_mask) & target_df["wind_speed"].notna()]
+        split_i = max(0, int(len(obs_non_out) * 0.80))
+        val_def_start = obs_non_out[split_i] if len(obs_non_out) > 0 else min_ts
+        val_def_end = obs_non_out[-1] if len(obs_non_out) > 0 else max_ts
+
+    val_start, val_end = _bind_datetime_window(
+        prefix=f"val_{sig}",
+        default_start=val_def_start,
+        default_end=val_def_end,
+        min_ts=min_ts,
+        max_ts=max_ts,
+        slider_label="Or Drag Validation Window",
+        reset_label="↺ Reset Default Validation Window",
+    )
+    val_window_mask = (target_df.index >= val_start) & (target_df.index <= val_end)
 
     # ---------------- Filter Offline References & Build Physics Features ----------------
     active_refs: Dict[str, pd.DataFrame] = {}
@@ -393,53 +491,41 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
     features_all = build_features_from_frames(active_refs, include_direction=True)
     features_aligned = features_all.reindex(target_df.index).interpolate(method="linear").bfill().ffill()
     feature_cols = list(features_aligned.columns)
-
     rho_ref_series = compute_air_density_from_frames(active_refs)
 
-    # ---------------- Sidebar: 3. Physics Options ----------------
-    st.sidebar.header("3. Physics Options")
-    st.sidebar.caption("Orthogonal directional vectors `(u, v)` are permanently enabled.")
+    # ---------------- Sidebar: 4. Physics Options ----------------
+    st.sidebar.markdown("---")
+    st.sidebar.header("4. Physics Options")
+    st.sidebar.caption("Directional wind components `(u, v)` are permanently active.")
     if rho_ref_series is not None:
         use_density = st.sidebar.toggle(
-            "IEC 61400-12-1 Air Density Normalization",
+            "IEC 61400-12-1 Air Density Correction",
             value=True,
-            help="Normalizes predicted wind speeds via v_norm = v * (rho / 1.225)^(1/3) using barometric pressure and ambient temperature from uploaded references.",
+            help="Plain-English explanation: Warm summer air is thinner and pushes turbine blades slightly less hard than cold dense winter air at the same wind speed. This toggle adjusts the power curve using real air pressure & temperature from the reference farm.",
         )
     else:
         use_density = False
-        st.sidebar.caption("ℹ️ IEC Air Density Normalization unavailable (uploaded reference files do not contain variable pressure & temperature columns).")
+        st.sidebar.caption("ℹ️ Air Density Correction unavailable (uploaded references lack variable pressure & temperature).")
 
-    # ---------------- Model Training & Outage Inference ----------------
-    non_outage_observed = (~outage_mask) & target_df["wind_speed"].notna() & features_aligned[feature_cols].notna().all(axis=1)
-    flagged_test_observed = (~outage_mask) & target_df["test_set"] & target_df["wind_speed"].notna()
-
-    if flagged_test_observed.sum() >= 12 and (non_outage_observed & (~target_df["test_set"])).sum() >= 50:
-        train_mask = non_outage_observed & (~target_df["test_set"])
-        val_mask = flagged_test_observed
-        val_description = (
-            f"Unseen `test_set = True` validation rows outside the outage "
-            f"({target_df.index[val_mask].min():%Y-%m-%d %H:%M} → {target_df.index[val_mask].max():%Y-%m-%d %H:%M}, "
-            f"{int(val_mask.sum())} intervals)"
+    # ---------------- Model Training (Leak-Free: Excludes Outage + Validation Windows) ----------------
+    train_mask = (
+        (~outage_mask)
+        & (~val_window_mask)
+        & target_df["wind_speed"].notna()
+        & features_aligned[feature_cols].notna().all(axis=1)
+    )
+    if train_mask.sum() < 30:
+        st.error(
+            f"Only {int(train_mask.sum())} observed training intervals remain outside your Outage and Validation windows (need ≥ 30). "
+            "Please narrow the Outage or Validation window in the sidebar."
         )
-    else:
-        obs_indices = target_df.index[non_outage_observed]
-        if len(obs_indices) < 60:
-            st.error("Not enough observed historical rows outside the outage window to train and validate the model (need ≥ 60 intervals).")
-            st.stop()
-            return
-        split_pos = int(len(obs_indices) * 0.80)
-        train_idx_set = obs_indices[:split_pos]
-        val_idx_set = obs_indices[split_pos:]
-        train_mask = target_df.index.isin(train_idx_set)
-        val_mask = target_df.index.isin(val_idx_set)
-        val_description = (
-            f"20% chronological hold-out validation window "
-            f"({val_idx_set.min():%Y-%m-%d %H:%M} → {val_idx_set.max():%Y-%m-%d %H:%M}, {len(val_idx_set)} intervals)"
-        )
+        st.stop()
+        return
 
     predictor = BayesianWindSpeedPredictor(target_turbine=target_name)
     predictor.fit(features_aligned.loc[train_mask, feature_cols], target_df.loc[train_mask, "wind_speed"])
 
+    # ---------------- Outage Inference ----------------
     outage_feats = features_aligned.loc[outage_idx, feature_cols]
     outage_band_80 = predictor.predict_certainty_band(outage_feats, certainty_pct=80.0, coef_ci_pct=95.0)
 
@@ -466,53 +552,142 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
     loss_coef_hi_mwh = float(pw_coef_hi_kw.sum() / 6000.0)
 
     # ---------------- Validation Evaluation ----------------
-    val_feats = features_aligned.loc[val_mask, feature_cols]
-    val_band_80 = predictor.predict_certainty_band(val_feats, certainty_pct=80.0, coef_ci_pct=95.0)
-    val_act_ws = target_df.loc[val_mask, "wind_speed"].to_numpy(dtype=float)
-    val_pred_ws = val_band_80["median"].to_numpy(dtype=float)
+    val_mask = (
+        val_window_mask
+        & (~outage_mask)
+        & target_df["wind_speed"].notna()
+        & features_aligned[feature_cols].notna().all(axis=1)
+    )
+    has_valid_backtest = int(val_mask.sum()) >= 2
 
-    val_density_arr = None
-    if use_density and rho_ref_series is not None:
-        val_density_arr = rho_ref_series.reindex(target_df.index[val_mask]).interpolate(method="linear").bfill().ffill().to_numpy(dtype=float)
+    if has_valid_backtest:
+        val_feats = features_aligned.loc[val_mask, feature_cols]
+        val_band_80 = predictor.predict_certainty_band(val_feats, certainty_pct=80.0, coef_ci_pct=95.0)
+        val_act_ws = target_df.loc[val_mask, "wind_speed"].to_numpy(dtype=float)
+        val_pred_ws = val_band_80["median"].to_numpy(dtype=float)
 
-    val_act_pw = power_curve.predict_power(val_act_ws)
-    val_pred_pw = power_curve.predict_power(val_pred_ws, air_density=val_density_arr)
+        val_density_arr = None
+        if use_density and rho_ref_series is not None:
+            val_density_arr = rho_ref_series.reindex(target_df.index[val_mask]).interpolate(method="linear").bfill().ffill().to_numpy(dtype=float)
 
-    bt_ws_mae = float(mean_absolute_error(val_act_ws, val_pred_ws))
-    bt_ws_rmse = float(np.sqrt(mean_squared_error(val_act_ws, val_pred_ws)))
-    bt_ws_r2 = float(r2_score(val_act_ws, val_pred_ws))
-    bt_pw_mae = float(mean_absolute_error(val_act_pw, val_pred_pw))
-    bt_pw_rmse = float(np.sqrt(mean_squared_error(val_act_pw, val_pred_pw)))
-    bt_act_mwh = float(val_act_pw.sum() / 6000.0)
-    bt_pred_mwh = float(val_pred_pw.sum() / 6000.0)
-    bt_dev_mwh = bt_pred_mwh - bt_act_mwh
-    bt_dev_pct = float(100.0 * bt_dev_mwh / bt_act_mwh) if bt_act_mwh > 0 else float("nan")
-    bt_cov_pct = float(100.0 * np.mean((val_act_ws >= val_band_80["lower"]) & (val_act_ws <= val_band_80["upper"])))
+        val_act_pw = power_curve.predict_power(val_act_ws)
+        val_pred_pw = power_curve.predict_power(val_pred_ws, air_density=val_density_arr)
 
+        bt_ws_mae = float(mean_absolute_error(val_act_ws, val_pred_ws))
+        bt_ws_rmse = float(np.sqrt(mean_squared_error(val_act_ws, val_pred_ws)))
+        bt_ws_r2 = float(r2_score(val_act_ws, val_pred_ws))
+        bt_pw_mae = float(mean_absolute_error(val_act_pw, val_pred_pw))
+        bt_pw_rmse = float(np.sqrt(mean_squared_error(val_act_pw, val_pred_pw)))
+        bt_act_mwh = float(val_act_pw.sum() / 6000.0)
+        bt_pred_mwh = float(val_pred_pw.sum() / 6000.0)
+        bt_dev_mwh = bt_pred_mwh - bt_act_mwh
+        bt_dev_pct = float(100.0 * bt_dev_mwh / bt_act_mwh) if bt_act_mwh > 0 else float("nan")
+        bt_cov_pct = float(100.0 * np.mean((val_act_ws >= val_band_80["lower"]) & (val_act_ws <= val_band_80["upper"])))
+        val_description = (
+            f"{target_df.index[val_mask].min():%Y-%m-%d %H:%M} → {target_df.index[val_mask].max():%Y-%m-%d %H:%M} "
+            f"({int(val_mask.sum()):,} unseen 10-min intervals, {int(val_mask.sum())/6.0:.1f} hours)"
+        )
+    else:
+        bt_ws_mae = bt_ws_rmse = bt_ws_r2 = bt_pw_mae = bt_pw_rmse = float("nan")
+        bt_act_mwh = bt_pred_mwh = bt_dev_mwh = bt_dev_pct = bt_cov_pct = float("nan")
+        val_act_ws = np.array([])
+        val_pred_ws = np.array([])
+        val_description = "No observed target measurements in the selected validation window."
+
+    # ---------------- Reference Correlation & Shared History Table ----------------
     corr_rows = []
     tgt_train_ws = target_df.loc[train_mask, "wind_speed"]
     for r_name, r_df in active_refs.items():
         r_ws = r_df["wind_speed"].reindex(tgt_train_ws.index)
         ok = tgt_train_ws.notna() & r_ws.notna()
-        corr_val = float(tgt_train_ws[ok].corr(r_ws[ok])) if ok.sum() > 10 else float("nan")
-        corr_rows.append({"Reference Turbine": r_name, "Training Overlap (rows)": int(ok.sum()), "Pearson Correlation (r)": round(corr_val, 3)})
-    ranking_df = pd.DataFrame(corr_rows).sort_values("Pearson Correlation (r)", ascending=False).reset_index(drop=True)
+        n_shared = int(ok.sum())
+        corr_val = float(tgt_train_ws[ok].corr(r_ws[ok])) if n_shared > 10 else float("nan")
+        corr_rows.append(
+            {
+                "Reference Turbine": r_name,
+                "Shared Training History": f"{n_shared / 144.0:.1f} days ({n_shared:,} rows)",
+                "Correlation (r)": round(corr_val, 3),
+            }
+        )
+    ranking_df = pd.DataFrame(corr_rows).sort_values("Correlation (r)", ascending=False).reset_index(drop=True)
+
+    # =========================================================================
+    # MAIN PAGE HEADLINE: OUTAGE ENERGY LOSS SUMMARY (Visible Above All Tabs!)
+    # =========================================================================
+    st.markdown(
+        f"""
+<div class="loss-banner">
+  <h3>⚡ Headline Outage Energy Loss — Turbine {target_name} ({outage_start:%d %b %Y %H:%M} → {outage_end:%d %b %Y %H:%M})</h3>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "Estimated Energy Loss (P50)",
+        f"{loss_p50_mwh:,.2f} MWh",
+        help="Best central estimate of the electricity the turbine would have produced during the outage if it had stayed connected.",
+    )
+    m2.metric(
+        "95% Coefficient CI Loss",
+        f"{loss_coef_lo_mwh:,.2f} – {loss_coef_hi_mwh:,.2f} MWh",
+        help="Formula Uncertainty ONLY: How little the total MWh shifts when we vary the learned equation weights within their 95% statistical confidence intervals (ignoring random 10-minute wind gusts).",
+    )
+    m3.metric(
+        "80% Predictive Band (P10–P90)",
+        f"{loss_p10_mwh:,.2f} – {loss_p90_mwh:,.2f} MWh",
+        help="Weather & Gust Band: Combines formula uncertainty PLUS 10-minute random wind gusts between wind farms, summing every 10th-percentile (calm) vs. 90th-percentile (gusty) interval.",
+    )
+    m4.metric(
+        "Outage Duration & Avg Power",
+        f"{len(outage_idx) / 6.0:.1f} h · {pw_p50_kw.mean():,.0f} kW",
+        help=f"{len(outage_idx):,} consecutive 10-minute intervals at an average counterfactual output of {pw_p50_kw.mean():,.1f} kW.",
+    )
+
+    with st.expander("❓ Plain-English Guide: What is the difference between '95% Coefficient CI Loss' and '80% Predictive Band (P10–P90)'?"):
+        st.markdown(
+            """
+* **95% Coefficient CI Loss (*"How sure are we about our formula?"*):**  
+  Our model learns a mathematical formula connecting the neighbouring wind farms to your turbine using ~80+ days of historical data. Because we have over **11,000 ten-minute measurements**, those formula weights are pinned down very tightly. This narrow band shows how little the MWh claim changes if the true formula weights sit at the lower vs. upper edge of their 95% confidence range.
+* **80% Predictive Band `P10–P90` (*"How gusty can individual 10-minute intervals be?"*):**  
+  Even with a perfect formula, a localized wind gust hitting a neighbouring farm at 14:10 does not hit your turbine identically at the exact same minute. `P10` assumes every single 10-minute step landed on the calm side of normal turbulence, while `P90` assumes every single step landed on the windy side.
+* **Why does this matter for an insurance claim?**  
+  Over a multi-day outage, random 10-minute gusts (`+1 m/s` now, `-1 m/s` ten minutes later) mostly **cancel each other out**, whereas formula uncertainty does not cancel out. That is why real multi-day energy totals stay much closer to the central `P50` / Coefficient CI than to the extreme `P10–P90` gust edges!
+"""
+        )
 
     # ---------------- 4-Tab Interface ----------------
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📈 1. Wind Speed & Uncertainty",
-        "🔬 2. Prediction Method & Coefficient CIs",
-        "⚡ 3. Energy Loss (MWh) & Claim",
+        "📈 1. Wind Speed & Outage Timeline",
+        "🔬 2. Model Formula & Explanations",
+        "⚡ 3. Power Curves, Validation & Claim",
         "📋 4. 10-Min Interval Predictions",
     ])
 
     # ==================== TAB 1 ====================
     with tab1:
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Target / Outage Duration", f"{target_name} · {len(outage_idx) / 6.0:.1f} h", help=f"{len(outage_idx)} 10-minute intervals.")
-        col2.metric("Mean Predicted Wind (P50)", f"{p50_speed_outage.mean():.2f} m/s")
-        col3.metric("Mean Coeff 95% CI Half-Width", f"±{outage_band_80['coef_ci_halfwidth'].mean():.3f} m/s", help="Uncertainty of the mean regression line propagated from posterior coefficient covariance Σ_w.")
-        col4.metric("Validation Wind RMSE", f"{bt_ws_rmse:.3f} m/s", help="Evaluated on unseen validation rows.")
+        col1.metric(
+            "Mean Outage Wind Speed (P50)",
+            f"{p50_speed_outage.mean():.2f} m/s",
+            help="Average estimated hub-height wind speed at the offline turbine across the outage period.",
+        )
+        col2.metric(
+            "Formula 95% CI on Wind",
+            f"±{outage_band_80['coef_ci_halfwidth'].mean():.3f} m/s",
+            help="How tightly the average wind curve is known from the learned regression weights alone.",
+        )
+        col3.metric(
+            "Validation Wind MAE",
+            f"{bt_ws_mae:.3f} m/s" if has_valid_backtest else "N/A",
+            help="On unseen validation days, our 10-minute wind speed estimate is on average this many m/s away from the real anemometer reading.",
+        )
+        col4.metric(
+            "Validation Wind RMSE",
+            f"{bt_ws_rmse:.3f} m/s" if has_valid_backtest else "N/A",
+            help="Similar to average wind error (MAE), but penalizes large misses more heavily.",
+        )
 
         pad = timedelta(days=2)
         fig1 = go.Figure()
@@ -523,9 +698,9 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 x=outage_idx,
                 y=p10_speed_outage,
                 fill="tonexty",
-                fillcolor="rgba(37, 99, 235, 0.14)",
+                fillcolor="rgba(37, 99, 235, 0.15)",
                 line=dict(width=0),
-                name="80% Predictive Band (P10–P90: Coeff + Gusts)",
+                name="80% Predictive Band (P10–P90: Formula + Gusts)",
             )
         )
 
@@ -535,9 +710,9 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 x=outage_idx,
                 y=coef_lo_speed_outage,
                 fill="tonexty",
-                fillcolor="rgba(29, 78, 216, 0.42)",
+                fillcolor="rgba(29, 78, 216, 0.45)",
                 line=dict(width=0),
-                name="95% Mean Curve CI (Coefficient Uncertainty xᵀΣ_wx)",
+                name="95% Formula CI (Coefficient Uncertainty Only)",
             )
         )
 
@@ -548,8 +723,8 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 go.Scatter(
                     x=target_df.index,
                     y=features_aligned[s_col],
-                    name=f"Ref {s_col.replace('speed_', 'Park ')}",
-                    line=dict(color=palette[idx_c % len(palette)], width=1.1, dash="dot"),
+                    name=f"Ref {s_col.replace('speed_', 'Park ')} Speed",
+                    line=dict(color=palette[idx_c % len(palette)], width=1.2, dash="dot"),
                 )
             )
 
@@ -558,7 +733,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 x=target_df.index,
                 y=target_df["wind_speed"],
                 name=f"{target_name} Measured",
-                line=dict(color="#0f172a", width=1.4),
+                line=dict(color="#0f172a", width=1.5),
             )
         )
 
@@ -567,7 +742,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 x=outage_idx,
                 y=p50_speed_outage,
                 name=f"{target_name} Predicted (P50)",
-                line=dict(color="#2563eb", width=2.4),
+                line=dict(color="#2563eb", width=2.5),
             )
         )
 
@@ -581,30 +756,40 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
             annotation_position="top left",
         )
 
-        fig1.update_xaxes(range=[outage_start - pad, outage_end + pad], title="Timestamp")
-        fig1.update_yaxes(title="Wind Speed (m/s)")
-        fig1.update_layout(height=490, hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        fig1.update_xaxes(range=[outage_start - pad, outage_end + pad], title="Timestamp", tickfont=dict(size=13))
+        fig1.update_yaxes(title="Wind Speed (m/s)", tickfont=dict(size=13))
+        fig1.update_layout(
+            height=500,
+            font=PLOTLY_FONT,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=13)),
+        )
         st.plotly_chart(fig1, width="stretch")
 
     # ==================== TAB 2 ====================
     with tab2:
         left_c, right_c = st.columns([1.18, 1.0])
-
         coef_summary = predictor.get_coefficient_summary(ci_level=0.95)
 
         with left_c:
             st.subheader("Closed-Form Bayesian Ridge Equation")
-            st.markdown(
-                "Directional vectors (`u = v·sin(θ)`, `v = v·cos(θ)`) are permanently active. "
-                "Posterior weights `w` and their full covariance matrix `Σ_w` are learned analytically via Evidence Maximization:"
-            )
             st.code(predictor.get_formula(), language="text")
 
-            st.subheader("Posterior Coefficients & 95% Confidence Intervals")
-            st.caption(
-                f"Trained on {predictor.n_train_:,} historical 10-minute intervals "
-                f"(learned noise precision α = {predictor.model.alpha_:.3f}, weight regularization λ = {predictor.model.lambda_:.2f})."
-            )
+            with st.expander("❓ Plain-English Guide: Magnitude (`speed`) vs. Component Wind Speeds (`u`, `v`) — What is the difference?", expanded=True):
+                st.markdown(
+                    """
+* **Wind Speed Magnitude (`speed_O`, `speed_H`) — *"How fast is the air moving?"***  
+  This is the plain wind speed on the anemometer (like a car's speedometer reading `8 m/s`), completely ignoring compass direction. It captures the main baseline rule: *when wind is strong at the neighbouring wind parks, wind is strong at our turbine.*
+* **Directional Wind Components (`u`, `v`) — *"Which compass direction is that wind pushing from?"***  
+  Raw compass degrees have a wrap-around problem (`359°` and `1°` are both North, yet look `358°` apart mathematically!). To fix this cleanly, we split the wind into two smooth directional pushes:
+  * **`u = speed × sin(direction)` (East–West component):** Positive when blowing toward East/from East axis, capturing West-vs-East exposure.
+  * **`v = speed × cos(direction)` (North–South component):** Captures North-vs-South exposure.
+* **Why use BOTH Magnitude and Components together?**  
+  Even though modern turbines rotate (yaw) to face the wind, **hills, forests, and neighbouring turbines stay fixed on the ground**. From an open wind direction, wind reaches your turbine faster (`+` boost); from a sheltered or wake-shaded direction, wind arrives slightly slower (`−` adjustment). Using both lets `speed` set the main strength while `(u, v)` gently adjusts for terrain and wake sheltering!
+"""
+                )
+
+            st.subheader("Learned Park Coefficients & 95% Confidence Intervals")
             disp_coef = coef_summary.copy()
             disp_coef["95% Confidence Interval"] = disp_coef.apply(
                 lambda r: f"[{r['ci_lower']:+.4f}, {r['ci_upper']:+.4f}]", axis=1
@@ -617,6 +802,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     "abs_importance_pct": "Slope Share (%)",
                 }
             )[["Parameter", "Weight (w_i)", "Std. Error (SE)", "95% Confidence Interval", "Slope Share (%)"]]
+
             st.dataframe(
                 disp_coef.style.format(
                     {
@@ -625,9 +811,42 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                         "Slope Share (%)": lambda v: "—" if pd.isna(v) else f"{v:.1f}%",
                     }
                 ),
+                column_config={
+                    "Parameter": st.column_config.TextColumn(
+                        "Parameter",
+                        help="Aggregated per reference wind park (e.g. Park O combines O1–O2; Park H combines H1–H5) plus Intercept.",
+                    ),
+                    "Weight (w_i)": st.column_config.NumberColumn(
+                        "Weight (w_i)",
+                        help="How much predicted target wind speed changes (in m/s) when this input increases by 1 m/s.",
+                    ),
+                    "Std. Error (SE)": st.column_config.NumberColumn(
+                        "Std. Error (SE)",
+                        help="Typical statistical uncertainty (±1σ) around the learned weight.",
+                    ),
+                    "95% Confidence Interval": st.column_config.TextColumn(
+                        "95% Confidence Interval",
+                        help="We are 95% confident the true underlying weight lies inside this range.",
+                    ),
+                    "Slope Share (%)": st.column_config.TextColumn(
+                        "Slope Share (%)",
+                        help="Share of total feature weight magnitude contributed by this term.",
+                    ),
+                },
                 hide_index=True,
                 width="stretch",
             )
+
+            with st.expander("❓ Plain-English Guide: Park Aggregation, Bayesian Priors & How Weights Are Learned"):
+                st.markdown(
+                    f"""
+* **Aggregated by Wind Park (Not One Weight per Turbine):**  
+  Uploaded turbines from the same wind farm (such as `O1–O2` in **Park O**, or `H1–H5` in **Park H**) sit right next to each other and experience >96% identical wind. If you give 5 nearly identical turbines separate unregularized weights, they fight each other and produce confusing negative weights. Combining each park via its **median wind speed** and **average wind vector** gives one clean, reliable weight per wind park — and automatically survives single-sensor dropouts!
+* **Are the Bayesian Priors Always the Same?**  
+  * **Starting rule (Hyperprior):** **Yes** — the model always begins with the exact same flat, neutral "blank-slate" prior (`10⁻⁶`), never pre-biased by hand.
+  * **Final tuned strength (`α` and `λ`):** **Adapted automatically to your uploaded data!** From your {predictor.n_train_:,} training intervals, the model automatically tuned noise precision **α = {predictor.model.alpha_:.3f}** (measuring typical wind gust scatter) and smoothing strength **λ = {predictor.model.lambda_:.2f}** (preventing overfitting).
+"""
+                )
 
             slopes_only = coef_summary.iloc[1:].copy()
             fig_coef = go.Figure()
@@ -637,86 +856,87 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=slopes_only["coefficient"],
                     y=slopes_only["parameter"],
                     mode="markers",
-                    marker=dict(size=9, color="#1d4ed8"),
+                    marker=dict(size=10, color="#1d4ed8"),
                     error_x=dict(
                         type="data",
                         symmetric=False,
                         array=(slopes_only["ci_upper"] - slopes_only["coefficient"]).to_numpy(),
                         arrayminus=(slopes_only["coefficient"] - slopes_only["ci_lower"]).to_numpy(),
                         color="#1e40af",
-                        thickness=2,
+                        thickness=2.2,
                         width=6,
                     ),
                     name="Weight ± 95% CI",
                 )
             )
             fig_coef.update_layout(
-                height=280,
+                height=290,
+                font=PLOTLY_FONT,
                 title="Slope Coefficients with Posterior 95% Confidence Intervals",
                 xaxis_title="Coefficient Value",
                 yaxis_title="Feature",
-                margin=dict(l=20, r=20, t=40, b=20),
+                margin=dict(l=20, r=20, t=45, b=20),
             )
             st.plotly_chart(fig_coef, width="stretch")
 
         with right_c:
             st.subheader("Validation Scatter Check")
-            lim = float(max(val_act_ws.max(), val_pred_ws.max())) + 1.0
-            fig_scatter = go.Figure()
-            fig_scatter.add_trace(
-                go.Scatter(
-                    x=val_act_ws,
-                    y=val_pred_ws,
-                    mode="markers",
-                    marker=dict(size=5, color="#2563eb", opacity=0.45),
-                    name="Validation Intervals",
+            if has_valid_backtest:
+                lim = float(max(val_act_ws.max(), val_pred_ws.max())) + 1.0
+                fig_scatter = go.Figure()
+                fig_scatter.add_trace(
+                    go.Scatter(
+                        x=val_act_ws,
+                        y=val_pred_ws,
+                        mode="markers",
+                        marker=dict(size=5.5, color="#2563eb", opacity=0.45),
+                        name="10-min Validation Points",
+                    )
                 )
-            )
-            fig_scatter.add_trace(
-                go.Scatter(
-                    x=[0, lim],
-                    y=[0, lim],
-                    mode="lines",
-                    line=dict(color="#ef4444", dash="dash"),
-                    name="Perfect 1:1 Line",
+                fig_scatter.add_trace(
+                    go.Scatter(
+                        x=[0, lim],
+                        y=[0, lim],
+                        mode="lines",
+                        line=dict(color="#ef4444", dash="dash", width=2),
+                        name="Perfect 1:1 Agreement",
+                    )
                 )
-            )
-            fig_scatter.update_layout(
-                height=340,
-                xaxis_title=f"Measured {target_name} Wind Speed (m/s)",
-                yaxis_title=f"Predicted {target_name} Wind Speed (m/s)",
-                margin=dict(l=20, r=20, t=20, b=20),
-            )
-            st.plotly_chart(fig_scatter, width="stretch")
-            st.caption(f"Scored on: {val_description}")
+                fig_scatter.update_layout(
+                    height=350,
+                    font=PLOTLY_FONT,
+                    xaxis_title=f"Measured {target_name} Wind Speed (m/s)",
+                    yaxis_title=f"Predicted {target_name} Wind Speed (m/s)",
+                    margin=dict(l=20, r=20, t=20, b=20),
+                )
+                st.plotly_chart(fig_scatter, width="stretch")
+                st.caption(f"Validation window: {val_description}")
+            else:
+                st.warning("Select a Validation Period in the sidebar with observed target wind speeds to view the scatter check.")
 
-            st.subheader("Uploaded Reference Turbine Correlations")
-            st.dataframe(ranking_df, hide_index=True, width="stretch")
+            st.subheader("Individual Reference Turbine Matching")
+            st.dataframe(
+                ranking_df,
+                column_config={
+                    "Reference Turbine": st.column_config.TextColumn(
+                        "Reference Turbine",
+                        help="Individual uploaded reference turbine file.",
+                    ),
+                    "Shared Training History": st.column_config.TextColumn(
+                        "Shared Training History",
+                        help="Training Overlap: How many days (and 10-minute rows) BOTH the target turbine and this reference turbine had valid simultaneous wind readings during training.",
+                    ),
+                    "Correlation (r)": st.column_config.NumberColumn(
+                        "Correlation (r)",
+                        help="How closely this turbine's wind speed rises and falls in sync with the target turbine (1.000 = identical rhythm, 0.000 = unrelated).",
+                    ),
+                },
+                hide_index=True,
+                width="stretch",
+            )
 
     # ==================== TAB 3 ====================
     with tab3:
-        col_e1, col_e2, col_e3, col_e4 = st.columns(4)
-        col_e1.metric(
-            "Estimated Outage Loss (P50)",
-            f"{loss_p50_mwh:,.2f} MWh",
-            help="Central counterfactual energy lost during the selected outage window.",
-        )
-        col_e2.metric(
-            "95% Coefficient CI Loss",
-            f"{loss_coef_lo_mwh:,.2f} – {loss_coef_hi_mwh:,.2f} MWh",
-            help="Energy loss confidence interval propagated purely from the 95% confidence intervals of the regression coefficients.",
-        )
-        col_e3.metric(
-            "80% Predictive Band (P10–P90)",
-            f"{loss_p10_mwh:,.2f} – {loss_p90_mwh:,.2f} MWh",
-            help="Full Bayesian predictive interval combining coefficient uncertainty and 10-minute wind turbulence.",
-        )
-        col_e4.metric(
-            "Mean Lost Power (P50)",
-            f"{pw_p50_kw.mean():,.1f} kW",
-            help="Average counterfactual active power across the outage window.",
-        )
-
         c_left, c_right = st.columns(2)
 
         with c_left:
@@ -728,7 +948,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=outage_idx,
                     y=pw_p10_kw,
                     fill="tonexty",
-                    fillcolor="rgba(37, 99, 235, 0.14)",
+                    fillcolor="rgba(37, 99, 235, 0.15)",
                     line=dict(width=0),
                     name="80% Predictive Band (P10–P90)",
                 )
@@ -739,7 +959,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=outage_idx,
                     y=pw_coef_lo_kw,
                     fill="tonexty",
-                    fillcolor="rgba(29, 78, 216, 0.42)",
+                    fillcolor="rgba(29, 78, 216, 0.45)",
                     line=dict(width=0),
                     name="95% Coefficient CI Band",
                 )
@@ -749,10 +969,10 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=outage_idx,
                     y=pw_p50_kw,
                     name="P50 Lost Power (kW)",
-                    line=dict(color="#2563eb", width=2.0),
+                    line=dict(color="#2563eb", width=2.1),
                 )
             )
-            fig_p.update_layout(height=340, xaxis_title="Timestamp", yaxis_title="Active Power (kW)", hovermode="x unified")
+            fig_p.update_layout(height=360, font=PLOTLY_FONT, xaxis_title="Timestamp", yaxis_title="Active Power (kW)", hovermode="x unified")
             st.plotly_chart(fig_p, width="stretch")
 
         with c_right:
@@ -770,7 +990,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=outage_idx,
                     y=cum_p10,
                     fill="tonexty",
-                    fillcolor="rgba(14, 165, 233, 0.15)",
+                    fillcolor="rgba(14, 165, 233, 0.16)",
                     line=dict(width=0),
                     name="Cumulative P10–P90 Band",
                 )
@@ -781,7 +1001,7 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                     x=outage_idx,
                     y=cum_clo,
                     fill="tonexty",
-                    fillcolor="rgba(2, 132, 199, 0.40)",
+                    fillcolor="rgba(2, 132, 199, 0.42)",
                     line=dict(width=0),
                     name="Cumulative 95% Coeff CI",
                 )
@@ -790,37 +1010,56 @@ div[data-testid="stMetric"] * { color: #0f172a !important; }
                 go.Scatter(
                     x=outage_idx,
                     y=cum_p50,
-                    line=dict(color="#0284c7", width=2.3),
+                    line=dict(color="#0284c7", width=2.4),
                     name="Cumulative P50 Loss (MWh)",
                 )
             )
-            fig_cum.update_layout(height=340, xaxis_title="Timestamp", yaxis_title="Cumulative Loss (MWh)", hovermode="x unified")
+            fig_cum.update_layout(height=360, font=PLOTLY_FONT, xaxis_title="Timestamp", yaxis_title="Cumulative Loss (MWh)", hovermode="x unified")
             st.plotly_chart(fig_cum, width="stretch")
 
-        st.subheader("Model Accuracy Check on Unseen Validation Period")
-        st.caption(
-            f"**Evaluated on:** {val_description}. "
-            "**Summed Energy Yield Error (%)** measures `(Predicted MWh − Actual MWh) / Actual MWh` over the known validation period "
-            "(where real turbine measurements exist) to audit whether cumulative MWh claims have any systematic bias."
-        )
-        scorecard_df = pd.DataFrame(
-            [
-                {"Metric": "Wind Speed MAE", "Value": f"{bt_ws_mae:.3f} m/s", "Description": "Mean absolute 10-minute wind error"},
-                {"Metric": "Wind Speed RMSE", "Value": f"{bt_ws_rmse:.3f} m/s", "Description": "Root mean squared 10-minute wind error"},
-                {"Metric": "Wind Speed R²", "Value": f"{bt_ws_r2:.3f}", "Description": "Share of wind speed variance explained"},
-                {"Metric": "Power MAE", "Value": f"{bt_pw_mae:.1f} kW", "Description": "Mean absolute 10-minute active power error"},
-                {"Metric": "Power RMSE", "Value": f"{bt_pw_rmse:.1f} kW", "Description": "Root mean squared 10-minute active power error"},
-                {"Metric": "Validation Actual vs. Predicted Energy", "Value": f"{bt_act_mwh:.2f} MWh vs. {bt_pred_mwh:.2f} MWh", "Description": f"Net difference: {bt_dev_mwh:+.2f} MWh"},
-                {"Metric": "Summed Energy Yield Error (Validation)", "Value": f"{bt_dev_pct:+.2f}%", "Description": "Official hackathon metric: (Pred MWh − Actual MWh) / Actual MWh"},
-                {"Metric": "80% Band Empirical Coverage (P10–P90)", "Value": f"{bt_cov_pct:.1f}%", "Description": "Nominal calibration target: 80.0%"},
-            ]
-        )
-        st.dataframe(scorecard_df, hide_index=True, width="stretch")
+        st.subheader("Model Accuracy Check on Your Selected Validation Period")
+        with st.expander("❓ Plain-English Guide: How does this Validation Check work, and what do these metrics mean?"):
+            st.markdown(
+                """
+* **How the dress-rehearsal check works:**  
+  We hide the real measurements inside your chosen **Validation Period** (adjustable in Sidebar Section 3) so the model never sees them during training. Then we ask the model to reconstruct those days from the neighbouring farms and compare against what your turbine *actually* did.
+* **MAE (Mean Absolute Error):** Typical 10-minute miss in plain average terms.
+* **RMSE (Root Mean Squared Error):** Similar to MAE, but gives extra weight to occasional big gusts so large misses cannot hide.
+* **Summed Energy Yield Error (%):** The most important metric for insurance! Over the entire validation window, random 10-minute ups and downs cancel out — this percentage checks how close our **grand-total MWh** is to the real grand-total MWh (`0%` = spot-on total energy).
+"""
+            )
+
+        if has_valid_backtest:
+            st.caption(f"Evaluated strictly out-of-sample on: **{val_description}**")
+            scorecard_df = pd.DataFrame(
+                [
+                    {"Metric": "Wind Speed MAE", "Value": f"{bt_ws_mae:.3f} m/s", "Plain-English Meaning": "Average 10-minute wind speed difference from reality"},
+                    {"Metric": "Wind Speed RMSE", "Value": f"{bt_ws_rmse:.3f} m/s", "Plain-English Meaning": "Typical wind error when penalizing larger gust misses"},
+                    {"Metric": "Wind Speed R²", "Value": f"{bt_ws_r2:.3f}", "Plain-English Meaning": f"Model explains {bt_ws_r2 * 100:.1f}% of wind speed ups and downs"},
+                    {"Metric": "Power MAE", "Value": f"{bt_pw_mae:.1f} kW", "Plain-English Meaning": "Average 10-minute electrical power difference"},
+                    {"Metric": "Power RMSE", "Value": f"{bt_pw_rmse:.1f} kW", "Plain-English Meaning": "Typical 10-minute power error weighting larger swings"},
+                    {"Metric": "Validation Actual vs. Predicted MWh", "Value": f"{bt_act_mwh:.2f} MWh vs. {bt_pred_mwh:.2f} MWh", "Plain-English Meaning": f"Net difference of {bt_dev_mwh:+.2f} MWh over the validation window"},
+                    {"Metric": "Summed Energy Yield Error (%)", "Value": f"{bt_dev_pct:+.2f}%", "Plain-English Meaning": "Percentage difference in total energy over the validation window"},
+                    {"Metric": "80% Band Empirical Coverage (P10–P90)", "Value": f"{bt_cov_pct:.1f}%", "Plain-English Meaning": "Share of real 10-min wind readings falling inside our 80% band (ideal = 80%)"},
+                ]
+            )
+            st.dataframe(scorecard_df, hide_index=True, width="stretch")
+        else:
+            st.warning(
+                "The currently selected Validation Period contains fewer than 2 measured target wind speeds "
+                "(for example, it overlaps missing outage rows). Adjust **3. Validation Period** in the sidebar to dates where real measurements exist."
+            )
 
         st.markdown("---")
         st.subheader("📨 Insurance Claim Summary & Settlement Notice")
         with st.expander("Preview Formal Business Interruption Insurance Claim Notice", expanded=False):
             hours = len(outage_idx) / 6.0
+            val_line = (
+                f"{bt_dev_pct:+.2f}% ({bt_pred_mwh:.2f} MWh predicted vs. {bt_act_mwh:.2f} MWh actual)"
+                if has_valid_backtest
+                else "N/A (no measured validation window selected)"
+            )
+            ws_line = f"{bt_ws_rmse:.3f} m/s / {bt_ws_mae:.3f} m/s" if has_valid_backtest else "N/A"
             claim_text = f"""Subject: Business Interruption Insurance Claim Notice - Turbine {target_name} Outage
 
 To: Claims Adjustment Team (Renewable Energy Business Interruption Division)
@@ -838,7 +1077,7 @@ POLICY ID: WIND-ALL-RISK-2026-EU
 
 2. COUNTERFACTUAL LOSS ADJUSTMENT (IEC 61400 COMPLIANT)
 * Reference Turbines Utilized: {', '.join(active_refs.keys())}
-* Methodology: Bayesian Ridge Regression with permanent orthogonal directional vectors (u, v).
+* Methodology: Park-aggregated Bayesian Ridge Regression with permanent directional vectors (u, v).
 * Closed-Form Transfer Equation: {predictor.get_formula()}
 * Atmospheric Correction: IEC 61400-12-1 Air Density Normalization ({'Enabled' if use_density else 'Disabled'}).
 
@@ -849,8 +1088,8 @@ ESTIMATED PRODUCTION LOSS SUMMARY (MWh):
 * Outage Mean Lost Power:                  {pw_p50_kw.mean():,.1f} kW
 
 3. AUDIT TRAIL & VALIDATION
-* Unseen Validation Summed Energy Error: {bt_dev_pct:+.2f}% ({bt_pred_mwh:.2f} MWh predicted vs. {bt_act_mwh:.2f} MWh actual).
-* Unseen Validation Wind RMSE / MAE: {bt_ws_rmse:.3f} m/s / {bt_ws_mae:.3f} m/s.
+* Unseen Validation Summed Energy Error: {val_line}
+* Unseen Validation Wind RMSE / MAE:     {ws_line}
 
 Authorized Signature:
 Asset Performance & Risk Engineering Team, BayWa r.e.
@@ -866,13 +1105,23 @@ Asset Performance & Risk Engineering Team, BayWa r.e.
     # ==================== TAB 4 ====================
     with tab4:
         st.subheader(f"10-Minute Interval Predictions — Turbine {target_name}")
+        with st.expander("❓ Plain-English Guide: How to use the Certainty Slider & read every 10-minute row"):
+            st.markdown(
+                """
+* **Symmetric Percentile Certainty Slider (`50%–99%`):**  
+  Choose how wide a safety net you want around each 10-minute prediction. For example, **80% certainty** shows the `P10` (low/calm) to `P90` (high/windy) range where the true 10-minute wind speed is expected to land 8 times out of 10; **95% certainty** widens that net to `P2.5–P97.5`.
+* **Median `P50`:** Our single best middle-of-the-road estimate for that 10-minute slot.
+* **Coeff 95% CI ± (m/s):** Shows the tiny fraction of uncertainty coming purely from the learned formula weights (excluding random gusts).
+"""
+            )
+
         certainty_pct = st.slider(
             "Symmetric Percentile Certainty Level (%)",
             min_value=50,
             max_value=99,
             value=80,
             step=1,
-            help="Controls the symmetric Bayesian credible band around the P50 median for every 10-minute interval (e.g. 80% → P10.0 to P90.0; 90% → P5.0 to P95.0; 95% → P2.5 to P97.5).",
+            help="Slide higher (e.g. 90% or 95%) for a wider, safer low-to-high range on each 10-minute prediction, or lower (e.g. 50%) for the narrower middle quartile range.",
         )
 
         p_low_pct = (100.0 - certainty_pct) / 2.0
@@ -896,13 +1145,25 @@ Asset Performance & Risk Engineering Team, BayWa r.e.
         cum_md_mwh = np.cumsum(en_md_mwh)
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric(f"Lower Bound Total ({low_label})", f"{en_lo_mwh.sum():,.2f} MWh")
-        k2.metric("Median Total (P50)", f"{en_md_mwh.sum():,.2f} MWh")
-        k3.metric(f"Upper Bound Total ({high_label})", f"{en_hi_mwh.sum():,.2f} MWh")
+        k1.metric(
+            f"Lower Bound Total ({low_label})",
+            f"{en_lo_mwh.sum():,.2f} MWh",
+            help=f"Conservative MWh sum if every 10-minute interval landed at the lower {low_label} edge.",
+        )
+        k2.metric(
+            "Median Total (P50)",
+            f"{en_md_mwh.sum():,.2f} MWh",
+            help="Best central MWh loss total across all 10-minute outage intervals.",
+        )
+        k3.metric(
+            f"Upper Bound Total ({high_label})",
+            f"{en_hi_mwh.sum():,.2f} MWh",
+            help=f"Upper MWh sum if every 10-minute interval landed at the windy {high_label} edge.",
+        )
         k4.metric(
             f"{certainty_pct}% Band Width",
             f"{(en_hi_mwh.sum() - en_lo_mwh.sum()):,.2f} MWh",
-            help=f"Symmetric {low_label}–{high_label} range across {len(outage_idx)} intervals.",
+            help=f"Total spread between {low_label} and {high_label} across {len(outage_idx):,} intervals.",
         )
 
         interval_df = pd.DataFrame(
@@ -922,7 +1183,7 @@ Asset Performance & Risk Engineering Team, BayWa r.e.
             }
         )
 
-        st.dataframe(interval_df, hide_index=True, width="stretch", height=440)
+        st.dataframe(interval_df, hide_index=True, width="stretch", height=450)
 
         csv_bytes = interval_df.to_csv(index=False).encode("utf-8")
         st.download_button(

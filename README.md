@@ -1,5 +1,7 @@
 # BayWa r.e. Wind Turbine Outage Estimation Challenge
 
+> 📊 **Presentation & Full Process Handoff:** See [`PRESENTATION_GUIDE.md`](./PRESENTATION_GUIDE.md) for the complete end-to-end pipeline guide, UI walkthrough, exact `T1–T3` cheat-sheet numbers, slide deck blueprint, and judge Q&A — plus [`upsides_downsides_models.md`](./upsides_downsides_models.md) for the 3-branch model comparison.
+
 An end-to-end, highly explainable solution for estimating wind turbine energy yield loss during telemetry communication outages using external reference wind farms ($H_1\text{--}H_5$ and $O_1\text{--}O_2$).
 
 ---
