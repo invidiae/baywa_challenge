@@ -12,23 +12,52 @@ Key concepts:
    but once target wind speed is predicted, power is derived via the power curve).
 2. The transformation uses 1D piecewise linear interpolation, ensuring maximum explainability,
    monotonicity preservation, and alignment with IEC 61400 standards.
-3. Energy calculation:
+3. Quantile / Probabilistic Support:
+   Wind speed predictions with quantiles (e.g. q=0.1, q=0.5, q=0.9) are mapped directly through
+   the power curve: P_q = P(v_q), preserving uncertainty intervals into power (kW) and energy loss (kWh/MWh).
+4. IEC 61400-12-1 Air Density Normalization (Addon 2):
+   If air pressure (hPa) and ambient temperature (°C) are provided, wind speeds are normalized
+   prior to power curve lookup:
+   rho = (P * 100) / (287.05 * (T + 273.15))
+   v_norm = v * (rho / 1.225)^(1/3)
+5. Energy calculation:
    Energy (kWh) = Power (kW) * (Delta_t_minutes / 60)
    For 10-minute intervals: Delta_t / 60 = 1/6 hour.
 """
 
 from pathlib import Path
-
+from typing import Any, Dict, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
+
+R_SPECIFIC_AIR = 287.05  # J/(kg*K)
+RHO_STANDARD = 1.225      # kg/m^3 (IEC standard air density at 15°C, 1013.25 hPa)
+
+
+def compute_air_density(
+    air_pressure_hpa: Union[float, Sequence, np.ndarray, pd.Series],
+    temperature_c: Union[float, Sequence, np.ndarray, pd.Series],
+) -> Union[float, np.ndarray]:
+    """
+    Compute atmospheric air density (kg/m^3) using the Ideal Gas Law:
+    rho = (P_hpa * 100) / (287.05 * (T_c + 273.15))
+    """
+    is_scalar = np.isscalar(air_pressure_hpa) and np.isscalar(temperature_c)
+    p_pa = np.asarray([air_pressure_hpa] if is_scalar else air_pressure_hpa, dtype=float) * 100.0
+    t_k = np.asarray([temperature_c] if is_scalar else temperature_c, dtype=float) + 273.15
+
+    rho = p_pa / (R_SPECIFIC_AIR * t_k)
+    return float(rho[0]) if is_scalar else rho
 
 
 class PowerCurveModel:
     """
-    Interpolates turbine power curves and calculates power generation and energy yield.
+    Interpolates turbine power curves and calculates power generation and energy yield,
+    supporting both deterministic point predictions and probabilistic quantile forecasts,
+    with optional IEC 61400-12-1 air density normalization.
     """
 
-    def __init__(self, curve_df: pd.DataFrame, turbine_name: str | None = None):
+    def __init__(self, curve_df: pd.DataFrame, turbine_name: Optional[str] = None):
         """
         Initialize with a power curve DataFrame.
         Expected columns: 'wind_speed' and 'power'.
@@ -40,7 +69,6 @@ class PowerCurveModel:
         self.turbine_name = turbine_name or (
             curve_df["turbine_name"].iloc[0] if "turbine_name" in curve_df.columns else "Turbine"
         )
-        # Sort by wind speed to guarantee monotonic lookup
         self.curve = curve_df[["wind_speed", "power"]].dropna().sort_values("wind_speed").copy()
         self.speeds = self.curve["wind_speed"].to_numpy(dtype=float)
         self.powers = self.curve["power"].to_numpy(dtype=float)
@@ -50,97 +78,255 @@ class PowerCurveModel:
         self.max_curve_speed = float(self.speeds.max())
 
     @classmethod
-    def from_excel(cls, file_path: str | Path, sheet_name: str | None = None) -> "PowerCurveModel":
+    def from_excel(cls, file_path: Union[str, Path], sheet_name: Optional[str] = None) -> "PowerCurveModel":
         """Load power curve from an Excel file (e.g. data/T1_power_curve.xlsx)."""
         file_path = Path(file_path)
         df = pd.read_excel(file_path, sheet_name=sheet_name if sheet_name else 0)
         return cls(df, turbine_name=file_path.stem.replace("_power_curve", ""))
 
+    def _normalize_speed_for_density(
+        self,
+        speeds: np.ndarray,
+        air_density: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        air_pressure_hpa: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        temperature_c: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+    ) -> np.ndarray:
+        """
+        Normalize wind speed according to IEC 61400-12-1:
+        v_norm = v * (rho / rho_0)^(1/3)
+        """
+        rho = None
+        if air_density is not None:
+            rho = np.asarray(air_density, dtype=float)
+        elif air_pressure_hpa is not None and temperature_c is not None:
+            rho = compute_air_density(air_pressure_hpa, temperature_c)
+
+        if rho is None:
+            return speeds
+
+        density_ratio = np.clip(rho / RHO_STANDARD, 0.5, 2.0)
+        correction_factor = density_ratio ** (1.0 / 3.0)
+
+        # Broadcast if correction_factor is 1D and speeds is 2D
+        if correction_factor.ndim == 1 and speeds.ndim == 2:
+            correction_factor = correction_factor[:, np.newaxis]
+
+        return speeds * correction_factor
+
+    def _interpolate_speeds(self, speeds: np.ndarray, cut_out_to_zero: bool = True) -> np.ndarray:
+        """Internal helper to interpolate a numpy array of arbitrary shape."""
+        orig_shape = speeds.shape
+        flat_v = speeds.ravel()
+        flat_p = np.full_like(flat_v, np.nan, dtype=float)
+
+        valid_mask = ~np.isnan(flat_v)
+        if np.any(valid_mask):
+            v_valid = flat_v[valid_mask]
+            right_val = 0.0 if cut_out_to_zero else float(self.powers[-1])
+            flat_p[valid_mask] = np.interp(v_valid, self.speeds, self.powers, left=0.0, right=right_val)
+
+        return flat_p.reshape(orig_shape)
+
     def predict_power(
         self,
-        wind_speeds: float | list | np.ndarray | pd.Series,
+        wind_speeds: Union[float, Sequence, np.ndarray, pd.Series, pd.DataFrame, Dict[Any, Any]],
         cut_out_to_zero: bool = True,
-    ) -> float | np.ndarray:
+        air_density: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        air_pressure_hpa: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        temperature_c: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+    ) -> Union[float, np.ndarray, pd.Series, pd.DataFrame, Dict[Any, np.ndarray]]:
         """
-        Map wind speed (m/s) to power (kW) using linear interpolation.
-
-        Parameters:
-        - wind_speeds: wind speed value or array-like
-        - cut_out_to_zero: if True, wind speeds strictly exceeding the max power curve table
-          speed (e.g., > 26 m/s) are set to 0 kW (storm cut-out shut down).
-
-        Returns:
-        - Power in kW (float or numpy array). Preserves NaNs.
+        Map wind speed (m/s) to power (kW) using piecewise linear interpolation,
+        with optional IEC 61400-12-1 air density normalization.
         """
+        if isinstance(wind_speeds, pd.DataFrame):
+            p_df = pd.DataFrame(index=wind_speeds.index)
+            for col in wind_speeds.columns:
+                arr = wind_speeds[col].to_numpy(dtype=float)
+                arr_norm = self._normalize_speed_for_density(
+                    arr, air_density=air_density, air_pressure_hpa=air_pressure_hpa, temperature_c=temperature_c
+                )
+                p_df[col] = self._interpolate_speeds(arr_norm, cut_out_to_zero=cut_out_to_zero)
+            return p_df
+
+        if isinstance(wind_speeds, dict):
+            out = {}
+            for q, val in wind_speeds.items():
+                arr = np.asarray(val, dtype=float)
+                arr_norm = self._normalize_speed_for_density(
+                    arr, air_density=air_density, air_pressure_hpa=air_pressure_hpa, temperature_c=temperature_c
+                )
+                out[q] = self._interpolate_speeds(arr_norm, cut_out_to_zero=cut_out_to_zero)
+            return out
+
+        if isinstance(wind_speeds, pd.Series):
+            arr = wind_speeds.to_numpy(dtype=float)
+            arr_norm = self._normalize_speed_for_density(
+                arr, air_density=air_density, air_pressure_hpa=air_pressure_hpa, temperature_c=temperature_c
+            )
+            interp = self._interpolate_speeds(arr_norm, cut_out_to_zero=cut_out_to_zero)
+            return pd.Series(interp, index=wind_speeds.index, name="predicted_power_kw")
+
         is_scalar = np.isscalar(wind_speeds)
         v = np.asarray([wind_speeds] if is_scalar else wind_speeds, dtype=float)
-
-        # Create output array initialized with NaN
-        p = np.full_like(v, np.nan, dtype=float)
-        valid_mask = ~np.isnan(v)
-
-        if np.any(valid_mask):
-            v_valid = v[valid_mask]
-
-            # Linear interpolation:
-            # - Wind speeds <= 0 or below minimum curve point -> 0 kW
-            # - Wind speeds > max_curve_speed:
-            #     if cut_out_to_zero -> 0 kW (storm shutdown)
-            #     else -> interpolate / extrapolate flat to last power value
-            right_val = 0.0 if cut_out_to_zero else float(self.powers[-1])
-            p_interp = np.interp(v_valid, self.speeds, self.powers, left=0.0, right=right_val)
-            p[valid_mask] = p_interp
-
-        return p[0] if is_scalar else p
+        v_norm = self._normalize_speed_for_density(
+            v, air_density=air_density, air_pressure_hpa=air_pressure_hpa, temperature_c=temperature_c
+        )
+        p = self._interpolate_speeds(v_norm, cut_out_to_zero=cut_out_to_zero)
+        return float(p[0]) if is_scalar else p
 
     def calculate_energy(
         self,
-        power_kw: float | list | np.ndarray | pd.Series,
+        power_kw: Union[float, Sequence, np.ndarray, pd.Series, pd.DataFrame, Dict[Any, Any]],
         interval_minutes: float = 10.0,
-    ) -> float | np.ndarray:
+    ) -> Union[float, np.ndarray, pd.Series, pd.DataFrame, Dict[Any, Any]]:
         """
         Calculate energy yield / loss in kWh from power in kW.
         Formula: Energy (kWh) = Power (kW) * (interval_minutes / 60.0)
         """
         hours = interval_minutes / 60.0
+
+        if isinstance(power_kw, (pd.DataFrame, pd.Series)):
+            return power_kw * hours
+
+        if isinstance(power_kw, dict):
+            return {k: (v * hours if isinstance(v, np.ndarray) else np.asarray(v) * hours) for k, v in power_kw.items()}
+
         if np.isscalar(power_kw):
             return np.nan if np.isnan(power_kw) else float(power_kw) * hours
-        p = np.asarray(power_kw, dtype=float)
-        return p * hours
+
+        return np.asarray(power_kw, dtype=float) * hours
 
     def estimate_outage_loss(
         self,
-        predicted_speeds: np.ndarray | pd.Series,
-        timestamps: np.ndarray | pd.Series | None = None,
+        predicted_speeds: Union[np.ndarray, pd.Series],
+        timestamps: Optional[Union[np.ndarray, pd.Series]] = None,
         interval_minutes: float = 10.0,
+        air_density: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        air_pressure_hpa: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        temperature_c: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
     ) -> pd.DataFrame:
         """
-        Generate a comprehensive table containing predicted wind speed,
-        power output (kW), interval energy loss (kWh), and cumulative loss (kWh & MWh).
+        Generate a table containing predicted wind speed, power output (kW),
+        interval energy loss (kWh), and cumulative loss (kWh & MWh).
         """
-        power_kw = self.predict_power(predicted_speeds)
+        power_kw = self.predict_power(
+            predicted_speeds,
+            air_density=air_density,
+            air_pressure_hpa=air_pressure_hpa,
+            temperature_c=temperature_c,
+        )
         energy_kwh = self.calculate_energy(power_kw, interval_minutes=interval_minutes)
 
         df = pd.DataFrame({
-            "predicted_wind_speed": predicted_speeds,
-            "predicted_power_kw": power_kw,
-            "energy_loss_kwh": energy_kwh,
+            "predicted_wind_speed": np.asarray(predicted_speeds),
+            "predicted_power_kw": np.asarray(power_kw),
+            "energy_loss_kwh": np.asarray(energy_kwh),
         })
 
         if timestamps is not None:
-            df.insert(0, "timestamp", timestamps)
+            df.insert(0, "timestamp", np.asarray(timestamps))
 
-        # Cumulative energy (ignoring NaNs for accumulation)
         df["cum_energy_loss_kwh"] = df["energy_loss_kwh"].fillna(0).cumsum()
         df["cum_energy_loss_mwh"] = df["cum_energy_loss_kwh"] / 1000.0
-
         return df
 
+    def estimate_outage_loss_quantiles(
+        self,
+        quantile_speeds: Union[pd.DataFrame, Dict[Union[float, str], Sequence], np.ndarray],
+        quantiles: Optional[Sequence[Union[float, str]]] = None,
+        timestamps: Optional[Union[np.ndarray, pd.Series]] = None,
+        interval_minutes: float = 10.0,
+        air_density: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        air_pressure_hpa: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+        temperature_c: Optional[Union[float, Sequence, np.ndarray, pd.Series]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Calculate power generation and energy yield losses across multiple quantiles,
+        supporting optional IEC 61400-12-1 air density normalization.
+        """
+        if isinstance(quantile_speeds, pd.DataFrame):
+            df_speeds = quantile_speeds.copy()
+        elif isinstance(quantile_speeds, dict):
+            df_speeds = pd.DataFrame(quantile_speeds)
+        elif isinstance(quantile_speeds, np.ndarray):
+            if quantile_speeds.ndim == 1:
+                col_name = quantiles[0] if quantiles else "q50"
+                df_speeds = pd.DataFrame({col_name: quantile_speeds})
+            elif quantile_speeds.ndim == 2:
+                cols = quantiles if quantiles is not None else [f"q{i+1}" for i in range(quantile_speeds.shape[1])]
+                df_speeds = pd.DataFrame(quantile_speeds, columns=cols)
+            else:
+                raise ValueError("quantile_speeds ndarray must be 1D or 2D")
+        else:
+            raise TypeError(f"Unsupported type for quantile_speeds: {type(quantile_speeds)}")
 
-def load_target_power_curves(data_dir: str | Path = "data") -> dict[str, PowerCurveModel]:
-    """
-    Convenience loader for all target turbine power curves (T1, T2, T3).
-    """
+        col_map = {}
+        for c in df_speeds.columns:
+            if isinstance(c, (float, int)):
+                col_map[c] = f"q{int(round(c * 100)):02d}" if 0 <= c <= 1 else f"q_{c}"
+            else:
+                col_map[c] = str(c)
+        df_speeds = df_speeds.rename(columns=col_map)
+        quantile_names = list(df_speeds.columns)
+
+        # 1. Power (kW) per quantile
+        df_power = pd.DataFrame(index=df_speeds.index)
+        for q in quantile_names:
+            arr = df_speeds[q].to_numpy(dtype=float)
+            arr_norm = self._normalize_speed_for_density(
+                arr, air_density=air_density, air_pressure_hpa=air_pressure_hpa, temperature_c=temperature_c
+            )
+            df_power[f"power_kw_{q}"] = self._interpolate_speeds(arr_norm)
+
+        # 2. Interval energy loss (kWh)
+        hours = interval_minutes / 60.0
+        df_loss_kwh = pd.DataFrame(index=df_speeds.index)
+        for q in quantile_names:
+            df_loss_kwh[f"energy_kwh_{q}"] = df_power[f"power_kw_{q}"] * hours
+
+        # 3. Cumulative loss (kWh and MWh)
+        df_cum_kwh = pd.DataFrame(index=df_speeds.index)
+        df_cum_mwh = pd.DataFrame(index=df_speeds.index)
+        for q in quantile_names:
+            df_cum_kwh[f"cum_loss_kwh_{q}"] = df_loss_kwh[f"energy_kwh_{q}"].fillna(0).cumsum()
+            df_cum_mwh[f"cum_loss_mwh_{q}"] = df_cum_kwh[f"cum_loss_kwh_{q}"] / 1000.0
+
+        # 4. Summary table
+        summary_rows = []
+        for q in quantile_names:
+            total_kwh = float(df_cum_kwh[f"cum_loss_kwh_{q}"].iloc[-1]) if len(df_cum_kwh) > 0 else 0.0
+            total_mwh = float(df_cum_mwh[f"cum_loss_mwh_{q}"].iloc[-1]) if len(df_cum_mwh) > 0 else 0.0
+            summary_rows.append({
+                "quantile": q,
+                "total_loss_kwh": total_kwh,
+                "total_loss_mwh": total_mwh,
+            })
+        df_summary = pd.DataFrame(summary_rows)
+
+        # 5. Combined tidy DataFrame
+        combined = pd.DataFrame(index=df_speeds.index)
+        if timestamps is not None:
+            combined["timestamp"] = np.asarray(timestamps)
+
+        for q in quantile_names:
+            combined[f"wind_speed_{q}"] = df_speeds[q].values
+            combined[f"power_kw_{q}"] = df_power[f"power_kw_{q}"].values
+            combined[f"energy_kwh_{q}"] = df_loss_kwh[f"energy_kwh_{q}"].values
+            combined[f"cum_mwh_{q}"] = df_cum_mwh[f"cum_loss_mwh_{q}"].values
+
+        return {
+            "power_kw": df_power,
+            "interval_loss_kwh": df_loss_kwh,
+            "cum_loss_kwh": df_cum_kwh,
+            "cum_loss_mwh": df_cum_mwh,
+            "summary": df_summary,
+            "combined_df": combined,
+        }
+
+
+def load_target_power_curves(data_dir: Union[str, Path] = "data") -> Dict[str, PowerCurveModel]:
+    """Convenience loader for all target turbine power curves (T1, T2, T3)."""
     data_dir = Path(data_dir)
     curves = {}
     for t_id in ["T1", "T2", "T3"]:
@@ -151,40 +337,18 @@ def load_target_power_curves(data_dir: str | Path = "data") -> dict[str, PowerCu
 
 
 if __name__ == "__main__":
-    print("Testing PowerCurveModel...")
+    print("Testing PowerCurveModel with IEC 61400-12-1 Air Density Correction...")
     curves = load_target_power_curves("data")
-    for name, model in curves.items():
-        print(f"Loaded {name}: cut-in speed = {model.cut_in_speed} m/s, rated power = {model.rated_power} kW")
+    t1 = curves["T1"]
 
-    # Test sample speed inputs
-    sample_speeds = [0.0, 2.0, 3.0, 5.0, 7.5, 11.5, 15.0, 20.0, 25.0, 27.0]
-    p_kw = curves["T1"].predict_power(sample_speeds)
-    e_kwh = curves["T1"].calculate_energy(p_kw)
+    sample_speeds = [3.0, 5.0, 7.5, 11.5, 15.0]
+    p_std = t1.predict_power(sample_speeds)
+    
+    # Warm summer air: 25°C, 995 hPa -> rho ≈ 1.162 kg/m^3 (thin air)
+    p_warm = t1.predict_power(sample_speeds, air_pressure_hpa=995.0, temperature_c=25.0)
+    
+    # Cold winter air: 0°C, 1020 hPa -> rho ≈ 1.300 kg/m^3 (dense air)
+    p_cold = t1.predict_power(sample_speeds, air_pressure_hpa=1020.0, temperature_c=0.0)
 
-    for s, p, e in zip(sample_speeds, p_kw, e_kwh):
-        print(f"Speed: {s:4.1f} m/s -> Power: {p:7.1f} kW -> Energy (10 min): {e:7.2f} kWh")
-
-
-"""USAGE
-
-from speed_to_power import load_target_power_curves
-import pandas as pd
-models = load_target_power_curves("data")
-t1_model = models["T1"]
-# Simulated quantile predictions from the wind speed model:
-quantile_speeds = pd.DataFrame({
-    0.1: [2.5, 4.0, 6.0, 9.0, 11.0],   # Lower bound (10th percentile)
-    0.5: [3.5, 5.5, 8.0, 11.5, 13.0],  # Median (50th percentile)
-    0.9: [5.0, 7.5, 10.5, 14.0, 16.5], # Upper bound (90th percentile)
-})
-timestamps = pd.date_range("2026-09-01 00:00", periods=5, freq="10min")
-# Compute power, interval losses, and cumulative outage yield losses:
-results = t1_model.estimate_outage_loss_quantiles(quantile_speeds, timestamps=timestamps)
-# View total outage loss summary (MWh) across quantiles:
-print(results["summary"])
-#   quantile  total_loss_kwh  total_loss_mwh
-#        q10     1546.166667        1.546167
-#        q50     2074.833333        2.074833
-#        q90     2672.333333        2.672333
-
-"""
+    for s, ps, pw, pc in zip(sample_speeds, p_std, p_warm, p_cold):
+        print(f"Speed: {s:4.1f} m/s | Standard: {ps:6.1f} kW | Warm (Thin): {pw:6.1f} kW | Cold (Dense): {pc:6.1f} kW")
