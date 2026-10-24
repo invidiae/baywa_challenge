@@ -22,7 +22,7 @@ The app starts clean so judges can watch a real workflow from raw Excel/CSV file
 
 As soon as the 3 uploads finish:
 * The **Outage Period** (`2026-09-01 00:00 → 2026-09-03 23:50`, 72 hours) is detected automatically.
-* The **Validation Period** (`2026-09-04 00:00 → 2026-09-09 23:50`, 144 hours) is held out automatically with **zero data leakage**.
+* **Background 5-Fold Time-Block Cross-Validation** runs automatically across all ~86 days (`~12,400` rows) so **100% of non-outage data** trains the main model (zero training data permanently withheld!).
 * The **Headline Outage Energy Loss (`MWh`)** appears immediately at the top of the main page above all 4 tabs.
 
 ---
@@ -32,7 +32,7 @@ As soon as the 3 uploads finish:
 | Judging Criterion | Weight | How Our System Scores Maximum Points |
 | :--- | :---: | :--- |
 | **Model Accuracy** | **40%** | Lowest cumulative **Energy Yield Deviation** across models (`4.71%` strict pre-outage mean error; `2.10%–7.43%` across turbines), strong wind/power RMSE & MAE, and calibrated `78.0%–79.7%` `P10–P90` uncertainty coverage (theoretical target: `80.0%`). |
-| **User Experience (GUI)** | **30%** | Clean browser GUI (`app.py`) with **Main-Page Headline Loss KPIs**, manual **Calendar Date/Time + Slider** controls for both Outage & Validation windows, enlarged readable typography, standardized `MWh` units, interactive Plotly dual-ribbon charts, a **4th tab with 10-minute interval explorer & certainty slider**, and plain-English `?` / `❓` explainers everywhere. |
+| **User Experience (GUI)** | **30%** | Clean browser GUI (`app.py`) with **Main-Page Headline Loss KPIs**, manual **Calendar Date/Time + Slider** controls for the Outage window + automatic **Background 5-Fold Cross-Validation**, enlarged readable typography, standardized `MWh` units, interactive Plotly dual-ribbon charts, a **4th tab with 10-minute interval explorer & certainty slider**, and plain-English `?` / `❓` explainers everywhere. |
 | **Solution Concept** | **20%** | Directly honors the hackathon's Golden Rule (*"If there is a trade-off between prediction accuracy and explainability, prioritize explainability"*): **Two-Stage Physics + Bayesian Ridge** gives a single closed-form linear equation per turbine with exact analytical 95% coefficient confidence intervals — plus **all 3 Bonus Challenges**. |
 | **Presentation** | **10%** | Clear narrative linking meteorology (directional vectors & air density), statistics (decomposed formula uncertainty vs. 10-minute gust scatter), and insurance auditability. |
 
@@ -47,7 +47,7 @@ As soon as the 3 uploads finish:
 
 ```mermaid
 flowchart LR
-    A["1. Upload Excel/CSV\nTarget (T1-T3)\nRefs (O1-O2, H1-H5)\nTarget Power Curve"] --> B["2. Time-Window Split\nAuto/Manual Outage\nAuto/Manual Validation\nLeak-Free Training Mask"]
+    A["1. Upload Excel/CSV\nTarget (T1-T3)\nRefs (O1-O2, H1-H5)\nTarget Power Curve"] --> B["2. 100% Data + 5-Fold CV\nAuto/Manual Outage\n100% Non-Outage Train\nBackground 5-Fold Block CV"]
     B --> C["3. Spatial & Vector Physics\nPark Medians (O, H)\nAlways-On Vectors (u, v)\nCross-Farm NaN Guard"]
     C --> D["4. Stage 1: Bayesian Ridge\nType-II MLE Priors (α, λ)\n95% Coefficient CIs\nAnalytical Percentiles"]
     D --> E["5. Stage 2: Power & IEC Density\nIdeal Gas Law ρ (Park H)\nIEC 61400-12-1 v_norm\nPiecewise Power Curve -> MWh"]
@@ -59,13 +59,16 @@ flowchart LR
 * **Offline Reference Protection:** If an uploaded reference turbine itself suffered an outage (`>50%` missing during the target's outage window), the app flags it with a warning and removes it automatically.
 * **Cross-Farm `NaN` Guard:** `sklearn.linear_model.BayesianRidge` does not accept `NaN` values natively (and Reference Park `O` has 3 isolated timestamps with missing wind direction). Our feature builder (`build_features_from_frames`) computes circular-mean park directions, falls back to cross-farm directional vectors if an entire park drops direction momentarily, and applies linear time interpolation + boundary fill so inference never crashes.
 
-### Process 2: Outage Detection & Leak-Free Adjustable Validation Window (`app.py`)
+### Process 2: Outage Detection & Background 5-Fold Time-Block Cross-Validation (`app.py`, `bayesian_wind_model.py`)
 * **Automatic Outage Detection + Calendar/Slider Override:** Scans the target turbine's wind speed series for the longest consecutive `NaN` block (`2026-09-01 00:00` to `2026-09-03 23:50`, `432` ten-minute intervals = `72.0 hours`). Users can fine-tune **Start Date, Start Time, End Date, and End Time** via calendar pickers or drag the range slider.
-* **Manually Adjustable Validation Period:** Defaults to the dataset's flagged validation block (`2026-09-04 00:00` to `2026-09-09 23:50`, `864` intervals = `144.0 hours`, or the final 20% of valid data if unflagged), and exposes the exact same **Start Date / Start Time / End Date / End Time** calendar pickers + drag slider in the sidebar (`3. Validation Period`).
-* **Strict Zero-Leakage Training Mask:**
-  $$\text{Train Mask} = (\neg \text{Outage}) \land (\neg \text{Validation}) \land \text{Observed}(v_T)$$
-  Whenever the user moves either the Outage window or the Validation window, the model immediately retrains **exclusively on the remaining ~83 days (~11,550 intervals)** of operational data, guaranteeing that validation metrics are 100% out-of-sample.
-* **What "Shared Training History" (Training Overlap) Means:** Shown in Tab 2's reference table, this is the exact count of historical 10-minute timestamps (outside both Outage and Validation) where **both** the target turbine and that specific reference turbine simultaneously reported valid wind speeds (e.g., `80.2 days / 11,557 rows`).
+* **100% Training Data Used (Zero Data Permanently Withheld):**
+  $$\text{Main Model Train Mask} = (\neg \text{Outage}) \land \text{Observed}(v_T)$$
+  The main `BayesianWindSpeedPredictor` trains on **100% of all valid non-outage historical telemetry** (`~12,421` ten-minute intervals = `~86.3 days`), so no training data is ever sacrificed and the headline Outage Energy Loss never fluctuates due to validation splits.
+* **Background 5-Fold Chronological Block Cross-Validation (`BayesianWindSpeedPredictor.cross_validate`):**
+  * Splits all valid non-outage history into **5 contiguous chronological time blocks (Folds 1–5, ~17 days each)**.
+  * Each fold is predicted strictly out-of-sample by a model trained only on the *other* 4 folds.
+  * Stitching the 5 held-out folds together produces a **100% out-of-sample cross-validated prediction series (`oof_df`)** across the entire 3-month dataset (~12,421 rows), plus a **Per-Fold Breakdown Table** in Tab 3 and out-of-fold cumulative energy error on the benchmark window (`+1.31%` on `T1`, `-3.51%` on `T2`).
+* **What "Shared Training History" (Training Overlap) Means:** Shown in Tab 2's reference table, this is the exact count of historical 10-minute timestamps outside the Outage window where **both** the target turbine and that specific reference turbine simultaneously reported valid wind speeds (`86.3 days / 12,421 rows`).
 
 ### Process 3: Park-Level Aggregation & Always-On Wind Vector Components (`u, v`)
 * **Park-Aggregated Coefficients (`O` and `H`) Instead of Per-Turbine Weights:**
@@ -133,29 +136,27 @@ Every UI refinement requested for clarity and executive usability is built in:
 ## 4. Master Results Cheat-Sheet (Ready to Copy onto Slides)
 
 ### A. 72-Hour Outage Energy Loss Estimates (`Sept 1, 00:00 → Sept 3, 23:50, 2026` — 432 Intervals)
-*(With default official split & IEC 61400-12-1 Air Density enabled)*
+*(Trained on 100% of non-outage data with IEC 61400-12-1 Air Density enabled)*
 
-| Turbine | Closed-Form Bayesian Ridge Transfer Equation | Expected Loss (`P50`) | `95% Coefficient CI` (Formula Uncertainty) | `80% Predictive Band` (`P10–P90` Gust Envelope) |
+| Turbine | Closed-Form Bayesian Ridge Transfer Equation (100% Non-Outage Data) | Expected Loss (`P50`) | `95% Coefficient CI` (Formula Uncertainty) | `80% Predictive Band` (`P10–P90` Gust Envelope) |
 | :---: | :--- | :---: | :---: | :---: |
-| **T1** | $\hat{v}_{T1} = 0.650 + 0.434\,v_O + 0.383\,v_H + 0.014\,u_O + 0.074\,v_{\text{ns},O} + 0.070\,u_H - 0.023\,v_{\text{ns},H}$ | **`76.11 MWh`** | `73.95 – 78.32 MWh` (`±2.19 MWh`) | `27.79 – 154.34 MWh` |
-| **T2** | $\hat{v}_{T2} = 0.616 + 0.409\,v_O + 0.404\,v_H - 0.041\,u_O + 0.040\,v_{\text{ns},O} + 0.011\,u_H - 0.079\,v_{\text{ns},H}$ | **`117.71 MWh`** | `115.37 – 120.07 MWh` (`±2.35 MWh`) | `58.60 – 192.79 MWh` |
-| **T3** | $\hat{v}_{T3} = 0.779 + 0.364\,v_O + 0.379\,v_H - 0.032\,u_O + 0.015\,v_{\text{ns},O} + 0.026\,u_H - 0.022\,v_{\text{ns},H}$ | **`90.63 MWh`** | `88.49 – 92.80 MWh` (`±2.16 MWh`) | `40.23 – 164.03 MWh` |
-| **Total Fleet** | **3 Target Turbines (`T1 + T2 + T3`) over 72-Hour Grid/Comms Outage** | **`284.45 MWh`** | **`277.81 – 291.19 MWh`** | **`126.62 – 511.16 MWh`** |
+| **T1** | $\hat{v}_{T1} = 0.665 + 0.428\,v_O + 0.384\,v_H + 0.023\,u_O + 0.072\,v_{\text{ns},O} + 0.063\,u_H - 0.025\,v_{\text{ns},H}$ | **`75.32 MWh`** | `73.34 – 77.35 MWh` (`±2.01 MWh`) | `26.79 – 154.80 MWh` |
+| **T2** | $\hat{v}_{T2} = 0.614 + 0.402\,v_O + 0.412\,v_H - 0.039\,u_O + 0.043\,v_{\text{ns},O} + 0.010\,u_H - 0.081\,v_{\text{ns},H}$ | **`117.16 MWh`** | `115.02 – 119.31 MWh` (`±2.15 MWh`) | `57.97 – 192.66 MWh` |
+| **T3** | $\hat{v}_{T3} = 0.776 + 0.358\,v_O + 0.387\,v_H - 0.030\,u_O + 0.014\,v_{\text{ns},O} + 0.024\,u_H - 0.026\,v_{\text{ns},H}$ | **`91.46 MWh`** | `89.48 – 93.46 MWh` (`±1.99 MWh`) | `40.34 – 165.92 MWh` |
+| **Total Fleet** | **3 Target Turbines (`T1 + T2 + T3`) over 72-Hour Grid/Comms Outage** | **`283.94 MWh`** | **`277.84 – 290.12 MWh`** | **`125.10 – 513.38 MWh`** |
 
-### B. Out-of-Sample Validation Backtest (`Sept 4, 00:00 → Sept 9, 23:50, 2026` — 864 Unseen Intervals)
+### B. Background 5-Fold Time-Block Cross-Validation Metrics (100% Out-of-Sample Across ~86 Days)
 
 | Metric | Turbine T1 | Turbine T2 | Turbine T3 | Why It Matters |
 | :--- | :---: | :---: | :---: | :--- |
-| **Shared Training History** | `11,511 rows` (`79.9 d`) | `11,557 rows` (`80.3 d`) | `11,557 rows` (`80.3 d`) | Zero overlap with Outage or Validation windows |
-| **Wind Speed MAE** | `1.261 m/s` | **`0.939 m/s`** | `1.033 m/s` | Instantaneous 10-min wind accuracy |
-| **Wind Speed RMSE** | `1.576 m/s` | **`1.233 m/s`** | `1.335 m/s` | Penalizes large gust errors |
-| **Wind Speed $R^2$** | `0.620` | **`0.790`** | `0.714` | Up to `79%` of variance explained from external farms |
-| **`P10–P90` Empirical Coverage** | `69.0%` | **`79.7%`** | **`78.0%`** | Calibrated right on the `80.0%` theoretical target |
-| **Power MAE (IEC / Std)** | `684.9` / `688.6 kW` | **`531.6`** / **`529.6 kW`** | `620.7` / `617.2 kW` | Beats LightGBM on `T2` by `~22 kW` |
-| **Power RMSE (IEC / Std)** | `939.4` / `943.4 kW` | **`777.8`** / **`777.5 kW`** | `868.5` / `864.4 kW` | Strong active-power tracking |
-| **Actual Validation Energy** | `213.16 MWh` | `312.23 MWh` | `271.67 MWh` | Ground-truth 6-day energy yield |
-| **Validation Energy Deviation (Std)** | `+7.43%` | **`-2.10%`** | `-7.42%` | **5.65% fleet mean \|error\|** |
-| **Validation Energy Deviation (IEC)** | **`+4.21%`** (`+8.98 MWh`) | **`-4.35%`** (`-13.58 MWh`) | `-9.86%` (`-26.80 MWh`) | Cuts `T1` bias by over `3.2` percentage points |
+| **Shared Training History (100% Data)** | `12,375 rows` (`85.9 d`) | `12,421 rows` (`86.3 d`) | `12,421 rows` (`86.3 d`) | Zero training data permanently withheld |
+| **5-Fold CV Wind Speed MAE** | `0.990 m/s` | **`0.880 m/s`** | `0.893 m/s` | Out-of-sample 10-min wind error across all 5 folds |
+| **5-Fold CV Wind Speed RMSE** | `1.338 m/s` | **`1.182 m/s`** | `1.194 m/s` | Out-of-sample RMSE across all ~12,400 intervals |
+| **5-Fold CV Wind Speed $R^2$** | `0.613` | **`0.727`** | `0.672` | Variance explained across the entire 3-month dataset |
+| **5-Fold CV `P10–P90` Coverage** | **`82.4%`** | **`82.8%`** | **`83.0%`** | Rock-solid calibration across all 5 folds (target = `80%`) |
+| **5-Fold CV Power MAE** | `492.6 kW` | `453.4 kW` | **`440.2 kW`** | Full-dataset out-of-sample 10-minute power error |
+| **5-Fold CV Power RMSE** | `770.8 kW` | `702.3 kW` | **`689.6 kW`** | Full-dataset out-of-sample 10-minute power RMSE |
+| **Out-of-Fold Benchmark Energy Error (`Sept 4–9`)** | **`+1.31%`** (`+2.79 MWh`) | **`-3.51%`** (`-10.97 MWh`) | `-11.06%` (`-30.04 MWh`) | Out-of-fold cumulative energy error on the 6-day test block |
 
 ---
 

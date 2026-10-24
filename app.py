@@ -441,34 +441,6 @@ div[data-testid="stMetricValue"] {
     outage_mask = (target_df.index >= outage_start) & (target_df.index <= outage_end)
     outage_idx = target_df.index[outage_mask]
 
-    # ---------------- Sidebar: 3. Validation Period (Manually Adjustable!) ----------------
-    st.sidebar.markdown("---")
-    st.sidebar.header("3. Validation Period")
-    st.sidebar.caption(
-        "Known historical window held out from training so we can verify accuracy against real measurements."
-    )
-
-    default_outage_mask = (target_df.index >= out_def_start) & (target_df.index <= out_def_end)
-    flagged_val_idx = target_df.index[(~default_outage_mask) & target_df["test_set"] & target_df["wind_speed"].notna()]
-    if len(flagged_val_idx) >= 12:
-        val_def_start, val_def_end = flagged_val_idx.min(), flagged_val_idx.max()
-    else:
-        obs_non_out = target_df.index[(~default_outage_mask) & target_df["wind_speed"].notna()]
-        split_i = max(0, int(len(obs_non_out) * 0.80))
-        val_def_start = obs_non_out[split_i] if len(obs_non_out) > 0 else min_ts
-        val_def_end = obs_non_out[-1] if len(obs_non_out) > 0 else max_ts
-
-    val_start, val_end = _bind_datetime_window(
-        prefix=f"val_{sig}",
-        default_start=val_def_start,
-        default_end=val_def_end,
-        min_ts=min_ts,
-        max_ts=max_ts,
-        slider_label="Or Drag Validation Window",
-        reset_label="↺ Reset Default Validation Window",
-    )
-    val_window_mask = (target_df.index >= val_start) & (target_df.index <= val_end)
-
     # ---------------- Filter Offline References & Build Physics Features ----------------
     active_refs: Dict[str, pd.DataFrame] = {}
     offline_refs: List[str] = []
@@ -493,10 +465,13 @@ div[data-testid="stMetricValue"] {
     feature_cols = list(features_aligned.columns)
     rho_ref_series = compute_air_density_from_frames(active_refs)
 
-    # ---------------- Sidebar: 4. Physics Options ----------------
+    # ---------------- Sidebar: 3. Physics & Cross-Validation ----------------
     st.sidebar.markdown("---")
-    st.sidebar.header("4. Physics Options")
-    st.sidebar.caption("Directional wind components `(u, v)` are permanently active.")
+    st.sidebar.header("3. Physics & Validation")
+    st.sidebar.caption(
+        "Directional wind vectors `(u, v)` are permanently active. "
+        "**5-Fold Time-Block Cross-Validation** runs automatically in the background so **100% of non-outage data** is used to train the main model."
+    )
     if rho_ref_series is not None:
         use_density = st.sidebar.toggle(
             "IEC 61400-12-1 Air Density Correction",
@@ -507,23 +482,25 @@ div[data-testid="stMetricValue"] {
         use_density = False
         st.sidebar.caption("ℹ️ Air Density Correction unavailable (uploaded references lack variable pressure & temperature).")
 
-    # ---------------- Model Training (Leak-Free: Excludes Outage + Validation Windows) ----------------
+    # ---------------- Model Training (Uses 100% of Valid Non-Outage Telemetry!) ----------------
     train_mask = (
         (~outage_mask)
-        & (~val_window_mask)
         & target_df["wind_speed"].notna()
         & features_aligned[feature_cols].notna().all(axis=1)
     )
     if train_mask.sum() < 30:
         st.error(
-            f"Only {int(train_mask.sum())} observed training intervals remain outside your Outage and Validation windows (need ≥ 30). "
-            "Please narrow the Outage or Validation window in the sidebar."
+            f"Only {int(train_mask.sum())} observed training intervals exist outside your Outage window (need ≥ 30). "
+            "Please narrow the Outage window in the sidebar."
         )
         st.stop()
         return
 
+    X_train_full = features_aligned.loc[train_mask, feature_cols]
+    y_train_full = target_df.loc[train_mask, "wind_speed"]
+
     predictor = BayesianWindSpeedPredictor(target_turbine=target_name)
-    predictor.fit(features_aligned.loc[train_mask, feature_cols], target_df.loc[train_mask, "wind_speed"])
+    predictor.fit(X_train_full, y_train_full)
 
     # ---------------- Outage Inference ----------------
     outage_feats = features_aligned.loc[outage_idx, feature_cols]
@@ -551,48 +528,77 @@ div[data-testid="stMetricValue"] {
     loss_coef_lo_mwh = float(pw_coef_lo_kw.sum() / 6000.0)
     loss_coef_hi_mwh = float(pw_coef_hi_kw.sum() / 6000.0)
 
-    # ---------------- Validation Evaluation ----------------
-    val_mask = (
-        val_window_mask
-        & (~outage_mask)
-        & target_df["wind_speed"].notna()
-        & features_aligned[feature_cols].notna().all(axis=1)
+    # ---------------- Background 5-Fold Time-Block Cross-Validation ----------------
+    oof_df, fold_meta = predictor.cross_validate(
+        X_train_full,
+        y_train_full,
+        n_splits=5,
+        certainty_pct=80.0,
+        coef_ci_pct=95.0,
     )
-    has_valid_backtest = int(val_mask.sum()) >= 2
+    has_valid_backtest = len(oof_df) >= 10
 
-    if has_valid_backtest:
-        val_feats = features_aligned.loc[val_mask, feature_cols]
-        val_band_80 = predictor.predict_certainty_band(val_feats, certainty_pct=80.0, coef_ci_pct=95.0)
-        val_act_ws = target_df.loc[val_mask, "wind_speed"].to_numpy(dtype=float)
-        val_pred_ws = val_band_80["median"].to_numpy(dtype=float)
+    val_act_ws = y_train_full.loc[oof_df.index].to_numpy(dtype=float)
+    val_pred_ws = oof_df["median"].to_numpy(dtype=float)
 
-        val_density_arr = None
-        if use_density and rho_ref_series is not None:
-            val_density_arr = rho_ref_series.reindex(target_df.index[val_mask]).interpolate(method="linear").bfill().ffill().to_numpy(dtype=float)
+    val_density_arr = None
+    if use_density and rho_ref_series is not None:
+        val_density_arr = rho_ref_series.reindex(oof_df.index).interpolate(method="linear").bfill().ffill().to_numpy(dtype=float)
 
-        val_act_pw = power_curve.predict_power(val_act_ws)
-        val_pred_pw = power_curve.predict_power(val_pred_ws, air_density=val_density_arr)
+    val_act_pw = power_curve.predict_power(val_act_ws)
+    val_pred_pw = power_curve.predict_power(val_pred_ws, air_density=val_density_arr)
 
-        bt_ws_mae = float(mean_absolute_error(val_act_ws, val_pred_ws))
-        bt_ws_rmse = float(np.sqrt(mean_squared_error(val_act_ws, val_pred_ws)))
-        bt_ws_r2 = float(r2_score(val_act_ws, val_pred_ws))
-        bt_pw_mae = float(mean_absolute_error(val_act_pw, val_pred_pw))
-        bt_pw_rmse = float(np.sqrt(mean_squared_error(val_act_pw, val_pred_pw)))
-        bt_act_mwh = float(val_act_pw.sum() / 6000.0)
-        bt_pred_mwh = float(val_pred_pw.sum() / 6000.0)
-        bt_dev_mwh = bt_pred_mwh - bt_act_mwh
-        bt_dev_pct = float(100.0 * bt_dev_mwh / bt_act_mwh) if bt_act_mwh > 0 else float("nan")
-        bt_cov_pct = float(100.0 * np.mean((val_act_ws >= val_band_80["lower"]) & (val_act_ws <= val_band_80["upper"])))
-        val_description = (
-            f"{target_df.index[val_mask].min():%Y-%m-%d %H:%M} → {target_df.index[val_mask].max():%Y-%m-%d %H:%M} "
-            f"({int(val_mask.sum()):,} unseen 10-min intervals, {int(val_mask.sum())/6.0:.1f} hours)"
-        )
+    # Full 5-Fold Out-of-Fold Cross-Validation Metrics (across 100% of non-outage history)
+    bt_ws_mae = float(mean_absolute_error(val_act_ws, val_pred_ws))
+    bt_ws_rmse = float(np.sqrt(mean_squared_error(val_act_ws, val_pred_ws)))
+    bt_ws_r2 = float(r2_score(val_act_ws, val_pred_ws))
+    bt_pw_mae = float(mean_absolute_error(val_act_pw, val_pred_pw))
+    bt_pw_rmse = float(np.sqrt(mean_squared_error(val_act_pw, val_pred_pw)))
+    bt_cov_pct = float(100.0 * np.mean((val_act_ws >= oof_df["lower"]) & (val_act_ws <= oof_df["upper"])))
+
+    # Evaluate multi-day summed Energy Yield Deviation on the benchmark validation block (out-of-fold)
+    flagged_test_mask = target_df.loc[oof_df.index, "test_set"].to_numpy(dtype=bool)
+    if int(flagged_test_mask.sum()) >= 12:
+        bench_mask = flagged_test_mask
+        bench_idx = oof_df.index[bench_mask]
+        bench_label = f"Official Benchmark Block ({bench_idx.min():%Y-%m-%d %H:%M} → {bench_idx.max():%Y-%m-%d %H:%M}, {len(bench_idx):,} intervals)"
     else:
-        bt_ws_mae = bt_ws_rmse = bt_ws_r2 = bt_pw_mae = bt_pw_rmse = float("nan")
-        bt_act_mwh = bt_pred_mwh = bt_dev_mwh = bt_dev_pct = bt_cov_pct = float("nan")
-        val_act_ws = np.array([])
-        val_pred_ws = np.array([])
-        val_description = "No observed target measurements in the selected validation window."
+        bench_mask = (oof_df["fold"] == 5).to_numpy(dtype=bool)
+        bench_idx = oof_df.index[bench_mask]
+        bench_label = f"Fold 5 Holdout Block ({bench_idx.min():%Y-%m-%d %H:%M} → {bench_idx.max():%Y-%m-%d %H:%M}, {len(bench_idx):,} intervals)"
+
+    bt_act_mwh = float(val_act_pw[bench_mask].sum() / 6000.0)
+    bt_pred_mwh = float(val_pred_pw[bench_mask].sum() / 6000.0)
+    bt_dev_mwh = bt_pred_mwh - bt_act_mwh
+    bt_dev_pct = float(100.0 * bt_dev_mwh / bt_act_mwh) if bt_act_mwh > 0 else float("nan")
+
+    # Build per-fold summary table for Tab 3
+    fold_rows = []
+    for fm in fold_meta:
+        f_num = fm["fold"]
+        f_mask = (oof_df["fold"] == f_num).to_numpy(dtype=bool)
+        f_act_ws = val_act_ws[f_mask]
+        f_pred_ws = val_pred_ws[f_mask]
+        f_act_pw = val_act_pw[f_mask]
+        f_pred_pw = val_pred_pw[f_mask]
+        f_cov = float(100.0 * np.mean((f_act_ws >= oof_df.loc[f_mask, "lower"]) & (f_act_ws <= oof_df.loc[f_mask, "upper"])))
+        fold_rows.append(
+            {
+                "Fold": f"Fold {f_num}",
+                "Time Period": f"{fm['start']:%d %b %Y} → {fm['end']:%d %b %Y}",
+                "Intervals": f"{fm['n_samples']:,} ({fm['n_samples'] / 6.0:.0f} h)",
+                "Wind MAE (m/s)": round(float(mean_absolute_error(f_act_ws, f_pred_ws)), 3),
+                "Wind RMSE (m/s)": round(float(np.sqrt(mean_squared_error(f_act_ws, f_pred_ws))), 3),
+                "Power MAE (kW)": round(float(mean_absolute_error(f_act_pw, f_pred_pw)), 1),
+                "80% Band Coverage": f"{f_cov:.1f}%",
+            }
+        )
+    fold_summary_df = pd.DataFrame(fold_rows)
+
+    val_description = (
+        f"5-Fold Time-Block Cross-Validation across all {len(oof_df):,} non-outage intervals "
+        f"({len(oof_df) / 144.0:.1f} days; zero training data permanently withheld)"
+    )
 
     # ---------------- Reference Correlation & Shared History Table ----------------
     corr_rows = []
@@ -1017,33 +1023,36 @@ div[data-testid="stMetricValue"] {
             fig_cum.update_layout(height=360, font=PLOTLY_FONT, xaxis_title="Timestamp", yaxis_title="Cumulative Loss (MWh)", hovermode="x unified")
             st.plotly_chart(fig_cum, width="stretch")
 
-        st.subheader("Model Accuracy Check on Your Selected Validation Period")
-        with st.expander("❓ Plain-English Guide: How does this Validation Check work, and what do these metrics mean?"):
+        st.subheader("Robust 5-Fold Cross-Validation Model Accuracy Metrics")
+        with st.expander("❓ Plain-English Guide: How does Background 5-Fold Cross-Validation work without losing training data?"):
             st.markdown(
                 """
-* **How the dress-rehearsal check works:**  
-  We hide the real measurements inside your chosen **Validation Period** (adjustable in Sidebar Section 3) so the model never sees them during training. Then we ask the model to reconstruct those days from the neighbouring farms and compare against what your turbine *actually* did.
-* **MAE (Mean Absolute Error):** Typical 10-minute miss in plain average terms.
-* **RMSE (Root Mean Squared Error):** Similar to MAE, but gives extra weight to occasional big gusts so large misses cannot hide.
-* **Summed Energy Yield Error (%):** The most important metric for insurance! Over the entire validation window, random 10-minute ups and downs cancel out — this percentage checks how close our **grand-total MWh** is to the real grand-total MWh (`0%` = spot-on total energy).
+* **Why we use Background 5-Fold Cross-Validation instead of permanently withholding data:**  
+  To get the most accurate outage claim possible, our main model trains on **100% of all valid non-outage historical data**. Meanwhile, in the background, we split the timeline into **5 contiguous chronological blocks (Folds 1–5)**. Each fold is predicted by a model trained only on the *other* 4 folds.
+* **What this gives you:**  
+  Every single non-outage timestamp in your dataset is evaluated **strictly out-of-sample**, producing rock-solid accuracy metrics across all ~86 days without ever shrinking the training dataset or changing your headline Outage Energy Loss!
+* **MAE & RMSE:** Typical 10-minute wind (`m/s`) and power (`kW`) error across all 5 out-of-sample folds.
+* **Out-of-Fold Benchmark Energy Error (%):** Compares out-of-fold predicted `MWh` against actual `MWh` over the multi-day benchmark block (`0%` = spot-on cumulative energy).
 """
             )
 
         if has_valid_backtest:
-            st.caption(f"Evaluated strictly out-of-sample on: **{val_description}**")
+            st.caption(f"Evaluated strictly out-of-sample via **{val_description}**")
             scorecard_df = pd.DataFrame(
                 [
-                    {"Metric": "Wind Speed MAE", "Value": f"{bt_ws_mae:.3f} m/s", "Plain-English Meaning": "Average 10-minute wind speed difference from reality"},
-                    {"Metric": "Wind Speed RMSE", "Value": f"{bt_ws_rmse:.3f} m/s", "Plain-English Meaning": "Typical wind error when penalizing larger gust misses"},
-                    {"Metric": "Wind Speed R²", "Value": f"{bt_ws_r2:.3f}", "Plain-English Meaning": f"Model explains {bt_ws_r2 * 100:.1f}% of wind speed ups and downs"},
-                    {"Metric": "Power MAE", "Value": f"{bt_pw_mae:.1f} kW", "Plain-English Meaning": "Average 10-minute electrical power difference"},
-                    {"Metric": "Power RMSE", "Value": f"{bt_pw_rmse:.1f} kW", "Plain-English Meaning": "Typical 10-minute power error weighting larger swings"},
-                    {"Metric": "Validation Actual vs. Predicted MWh", "Value": f"{bt_act_mwh:.2f} MWh vs. {bt_pred_mwh:.2f} MWh", "Plain-English Meaning": f"Net difference of {bt_dev_mwh:+.2f} MWh over the validation window"},
-                    {"Metric": "Summed Energy Yield Error (%)", "Value": f"{bt_dev_pct:+.2f}%", "Plain-English Meaning": "Percentage difference in total energy over the validation window"},
-                    {"Metric": "80% Band Empirical Coverage (P10–P90)", "Value": f"{bt_cov_pct:.1f}%", "Plain-English Meaning": "Share of real 10-min wind readings falling inside our 80% band (ideal = 80%)"},
+                    {"Metric": "5-Fold CV Wind Speed MAE", "Value": f"{bt_ws_mae:.3f} m/s", "Plain-English Meaning": "Average out-of-sample 10-minute wind speed error across all 5 folds"},
+                    {"Metric": "5-Fold CV Wind Speed RMSE", "Value": f"{bt_ws_rmse:.3f} m/s", "Plain-English Meaning": "Out-of-sample wind error penalizing larger gust misses across all 5 folds"},
+                    {"Metric": "5-Fold CV Wind Speed R²", "Value": f"{bt_ws_r2:.3f}", "Plain-English Meaning": f"Out-of-sample model explains {bt_ws_r2 * 100:.1f}% of wind speed variance"},
+                    {"Metric": "5-Fold CV Power MAE", "Value": f"{bt_pw_mae:.1f} kW", "Plain-English Meaning": "Average out-of-sample 10-minute electrical power error across all 5 folds"},
+                    {"Metric": "5-Fold CV Power RMSE", "Value": f"{bt_pw_rmse:.1f} kW", "Plain-English Meaning": "Out-of-sample 10-minute power RMSE across all 5 folds"},
+                    {"Metric": "5-Fold CV 80% Band Coverage (P10–P90)", "Value": f"{bt_cov_pct:.1f}%", "Plain-English Meaning": "Share of real 10-min wind readings falling inside our 80% band across all 5 folds (ideal = 80%)"},
+                    {"Metric": "Benchmark Block Actual vs. Out-of-Fold MWh", "Value": f"{bt_act_mwh:.2f} MWh vs. {bt_pred_mwh:.2f} MWh", "Plain-English Meaning": f"Net difference of {bt_dev_mwh:+.2f} MWh on {bench_label}"},
+                    {"Metric": "Out-of-Fold Summed Energy Yield Error (%)", "Value": f"{bt_dev_pct:+.2f}%", "Plain-English Meaning": f"Cumulative energy error on {bench_label}"},
                 ]
             )
             st.dataframe(scorecard_df, hide_index=True, width="stretch")
+            st.markdown("#### Per-Fold Chronological Cross-Validation Breakdown")
+            st.dataframe(fold_summary_df, hide_index=True, width="stretch")
         else:
             st.warning(
                 "The currently selected Validation Period contains fewer than 2 measured target wind speeds "

@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from sklearn.linear_model import BayesianRidge
+from sklearn.model_selection import KFold
 
 from speed_to_power import PowerCurveModel, compute_air_density, load_target_power_curves
 
@@ -409,6 +410,60 @@ class BayesianWindSpeedPredictor:
         summary = self.get_coefficient_summary(ci_level=ci_level)
         feat_df = summary.iloc[1:].copy().rename(columns={"parameter": "feature"})
         return feat_df.sort_values("abs_importance_pct", ascending=False).reset_index(drop=True)
+
+    def cross_validate(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        n_splits: int = 5,
+        certainty_pct: float = 80.0,
+        coef_ci_pct: float = 95.0,
+    ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+        """
+        Run K-Fold contiguous chronological block cross-validation in the background
+        without permanently withholding any training data from the main model.
+
+        Returns:
+        - oof_df: DataFrame indexed by valid non-outage timestamps with out-of-fold
+          predictions ('lower', 'median', 'upper', 'coef_ci_lower', 'coef_ci_upper',
+          'coef_ci_halfwidth', 'pred_std', 'fold').
+        - fold_meta: List of dicts with fold index and timestamp range metadata.
+        """
+        X_clean = self._clean_input(X)
+        valid_mask = X_clean.notna().all(axis=1) & y.notna()
+        X_valid = X_clean.loc[valid_mask]
+        y_valid = y.loc[valid_mask]
+
+        if len(X_valid) < max(n_splits * 2, 10):
+            raise ValueError(f"Insufficient valid samples ({len(X_valid)}) for {n_splits}-fold cross-validation.")
+
+        kf = KFold(n_splits=n_splits, shuffle=False)
+        cols = ["lower", "median", "upper", "coef_ci_lower", "coef_ci_upper", "coef_ci_halfwidth", "pred_std"]
+        oof_df = pd.DataFrame(np.nan, index=X_valid.index, columns=cols + ["fold"])
+        fold_meta: List[Dict[str, Any]] = []
+
+        for fold_idx, (tr_idx, va_idx) in enumerate(kf.split(X_valid), start=1):
+            fold_model = BayesianWindSpeedPredictor(target_turbine=self.target_turbine)
+            fold_model.fit(X_valid.iloc[tr_idx], y_valid.iloc[tr_idx])
+            fold_preds = fold_model.predict_certainty_band(
+                X_valid.iloc[va_idx],
+                certainty_pct=certainty_pct,
+                coef_ci_pct=coef_ci_pct,
+            )
+            oof_df.iloc[va_idx, : len(cols)] = fold_preds[cols].to_numpy()
+            oof_df.iloc[va_idx, len(cols)] = int(fold_idx)
+            va_index = X_valid.index[va_idx]
+            fold_meta.append(
+                {
+                    "fold": int(fold_idx),
+                    "start": va_index.min(),
+                    "end": va_index.max(),
+                    "n_samples": int(len(va_idx)),
+                }
+            )
+
+        oof_df["fold"] = oof_df["fold"].astype(int)
+        return oof_df, fold_meta
 
 
 def evaluate_bayesian_pipeline(
