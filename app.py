@@ -1,4 +1,6 @@
 """Business-friendly multi-reference wind imputation dashboard."""
+import urllib.parse
+
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
@@ -98,6 +100,31 @@ else:
     edited["predicted_power_kw"]=power_curve(edited.predicted_wind_speed,curve); edited["predicted_energy_kwh"]=edited.predicted_power_kw*result.interval_minutes/60
     st.metric("Predicted outage energy" if business_view else "Estimated outage energy yield",f"{edited.predicted_energy_kwh.sum():,.1f} kWh")
     st.caption("You may edit the central predicted wind-speed values above; power and energy update using your uploaded curve.")
+    st.subheader("Draft Email Report")
+    default_turbine_id = target_upload.name.rsplit(".", 1)[0]
+    turbine_id = st.text_input("Turbine ID", value=default_turbine_id, key="email_turbine_id")
+    outage_start = start.strftime("%d %B %Y")
+    outage_end = end.strftime("%d %B %Y")
+    total_kwh_lost = float(edited["predicted_energy_kwh"].sum())
+    subject = f"Wind Turbine Outage Report - {turbine_id}"
+    body = f"""Wind Turbine Outage Report
+
+Turbine ID: {turbine_id}
+Outage period: {outage_start} to {outage_end}
+Estimated energy lost: {total_kwh_lost:,.1f} kWh
+
+This estimate is based on the dashboard's current model predictions and selected outage period.
+
+Kind regards,
+Wind Energy Analytics Team
+"""
+    email_link = f"mailto:?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
+    st.markdown(
+        f'<a href="{email_link}" style="display:inline-block;padding:0.6rem 1rem;'
+        'background:#ff4b4b;color:white;border-radius:0.5rem;text-decoration:none;font-weight:600;">'
+        'Draft Email in Local Mail Client</a>',
+        unsafe_allow_html=True,
+    )
 
 st.header("Energy Loss Visualization" if not business_view else "Power difference over time")
 power_chart=go.Figure()
