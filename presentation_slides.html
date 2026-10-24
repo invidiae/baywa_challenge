@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BayWa r.e. — Wind Outage Energy Loss Estimation</title>
+<style>
+  :root {
+    --bg-dark: #0b1120;
+    --bg-card: rgba(30, 41, 59, 0.72);
+    --border-card: rgba(148, 163, 184, 0.22);
+    --text-main: #f8fafc;
+    --text-muted: #cbd5e1;
+    --accent-blue: #38bdf8;
+    --accent-indigo: #6366f1;
+    --accent-emerald: #34d399;
+    --accent-amber: #fbbf24;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: radial-gradient(circle at 15% 15%, #1e293b 0%, #0b1120 70%);
+    color: var(--text-main);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+    user-select: none;
+  }
+  .deck {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+  }
+  .slide {
+    position: absolute;
+    inset: 0;
+    padding: 3.8rem 5.5rem 4.5rem 5.5rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(12px);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+  }
+  .slide.active {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+  /* Header */
+  .top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.6rem;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 1rem;
+    border-radius: 999px;
+    font-size: 0.9rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: rgba(56, 189, 248, 0.14);
+    color: var(--accent-blue);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+  }
+  .brand {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #94a3b8;
+    letter-spacing: 0.03em;
+  }
+  h1 {
+    font-size: 2.75rem;
+    font-weight: 800;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin-top: 0.3rem;
+    background: linear-gradient(95deg, #ffffff 0%, #bae6fd 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    margin-top: 0.45rem;
+    font-weight: 400;
+  }
+  /* Grids & Cards */
+  .grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.6rem;
+    margin: auto 0;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1.05fr 1fr;
+    gap: 1.8rem;
+    margin: auto 0;
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-card);
+    border-radius: 18px;
+    padding: 1.75rem 1.85rem;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 16px 36px -12px rgba(0, 0, 0, 0.45);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .card.highlight {
+    border-color: rgba(56, 189, 248, 0.55);
+    background: linear-gradient(145deg, rgba(30, 58, 138, 0.42), rgba(15, 23, 42, 0.82));
+  }
+  .card-icon {
+    font-size: 1.9rem;
+    line-height: 1;
+  }
+  .card h3 {
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: #ffffff;
+  }
+  .card p, .card li {
+    font-size: 1.08rem;
+    line-height: 1.55;
+    color: var(--text-muted);
+  }
+  .card ul {
+    padding-left: 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .formula-box {
+    background: rgba(15, 23, 42, 0.92);
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    border-radius: 14px;
+    padding: 1.15rem 1.5rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 1.2rem;
+    color: #7dd3fc;
+    text-align: center;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+  .banner {
+    background: linear-gradient(90deg, rgba(56, 189, 248, 0.16), rgba(99, 102, 241, 0.16));
+    border: 1px solid rgba(56, 189, 248, 0.38);
+    border-radius: 14px;
+    padding: 1.05rem 1.6rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 1.12rem;
+    color: #e2e8f0;
+  }
+  .banner strong {
+    color: var(--accent-blue);
+    font-size: 1.25rem;
+  }
+  /* Metrics Table */
+  table.clean-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 1.08rem;
+  }
+  table.clean-table th {
+    text-align: left;
+    padding: 0.85rem 1rem;
+    color: #94a3b8;
+    font-weight: 600;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  }
+  table.clean-table td {
+    padding: 0.9rem 1rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    color: #f1f5f9;
+  }
+  table.clean-table tr:last-child td { border-bottom: none; }
+  .badge-good {
+    background: rgba(52, 211, 153, 0.16);
+    color: #6ee7b7;
+    padding: 0.22rem 0.65rem;
+    border-radius: 8px;
+    font-weight: 700;
+  }
+  .badge-blue {
+    background: rgba(56, 189, 248, 0.16);
+    color: #7dd3fc;
+    padding: 0.22rem 0.65rem;
+    border-radius: 8px;
+    font-weight: 700;
+  }
+  .kpi-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.2rem;
+  }
+  .kpi-box {
+    background: rgba(15, 23, 42, 0.78);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 14px;
+    padding: 1.1rem 1.3rem;
+  }
+  .kpi-val {
+    font-size: 2rem;
+    font-weight: 800;
+    color: var(--accent-blue);
+    margin-top: 0.2rem;
+  }
+  .kpi-lbl {
+    font-size: 0.92rem;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+  /* Footer Nav */
+  .nav-bar {
+    position: fixed;
+    bottom: 1.2rem;
+    right: 2.2rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    z-index: 50;
+  }
+  .nav-btn {
+    background: rgba(30, 41, 59, 0.85);
+    color: #e2e8f0;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 10px;
+    padding: 0.45rem 0.9rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .nav-btn:hover { background: rgba(56, 189, 248, 0.25); }
+  .slide-counter {
+    font-size: 0.95rem;
+    color: #94a3b8;
+    font-weight: 600;
+    min-width: 3.5rem;
+    text-align: center;
+  }
+  @media print {
+    body { overflow: visible; height: auto; background: #0b1120; }
+    .slide {
+      position: relative;
+      opacity: 1 !important;
+      pointer-events: auto !important;
+      transform: none !important;
+      page-break-after: always;
+      height: 100vh;
+      width: 100vw;
+    }
+    .nav-bar { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="deck">
+
+  <!-- ==================== SLIDE 1: MOTIVATION ==================== -->
+  <section class="slide active">
+    <div>
+      <div class="top-bar">
+        <span class="pill">Slide 1 · Problem & Motivation</span>
+        <span class="brand">BayWa r.e. Wind Challenge</span>
+      </div>
+      <h1>When a Wind Turbine Goes Dark, How Much Energy Was Lost?</h1>
+      <p class="subtitle">Turning missing blackout data into an auditable Business Interruption insurance claim.</p>
+    </div>
+
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-icon">🔌</div>
+        <h3>1. The Grid Outage</h3>
+        <p>Cable damage or grid faults disconnect the wind farm. The turbines stop generating electricity and revenue drops to zero.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🌫️</div>
+        <h3>2. The Sensor Blind Spot</h3>
+        <p>Normally, we compute lost energy from the turbine's own wind sensor. During a blackout, <strong>that sensor is offline too</strong> (<code>NaN</code>).</p>
+      </div>
+
+      <div class="card highlight">
+        <div class="card-icon">🧭</div>
+        <h3>3. Our Automated Solution</h3>
+        <p>We learn how neighbouring wind parks (<strong>Park O</strong> &amp; <strong>Park H</strong>) relate to our turbine before the outage, reconstruct the missing wind, and calculate lost <strong>MWh</strong>.</p>
+      </div>
+    </div>
+
+    <div class="banner">
+      <span>🎯 <strong>Goal for Insurance Claims:</strong> Accurate, transparent, and easy for any claims adjuster to verify.</span>
+      <strong>72h Outage Fleet Loss: 283.9 MWh</strong>
+    </div>
+  </section>
+
+  <!-- ==================== SLIDE 2: SIMPLE & EXPLAINABLE MODEL ==================== -->
+  <section class="slide">
+    <div>
+      <div class="top-bar">
+        <span class="pill">Slide 2 · Explainable Architecture</span>
+        <span class="brand">BayWa r.e. Wind Challenge</span>
+      </div>
+      <h1>Why Our Model Is Simple, Physical &amp; 100% Explainable</h1>
+      <p class="subtitle">Prioritizing explainability — one clean equation instead of a black box.</p>
+    </div>
+
+    <div class="formula-box">
+      Predicted Wind Speed = w₀ + w_O · Speed(Park O) + w_H · Speed(Park H) + Direction Adjustments (u, v)
+    </div>
+
+    <div class="grid-3">
+      <div class="card highlight">
+        <div class="card-icon">🔍</div>
+        <h3>One Readable Formula</h3>
+        <ul>
+          <li>Uses <strong>Bayesian Ridge Regression</strong>.</li>
+          <li>Every turbine gets a single linear equation you can check on a calculator.</li>
+          <li>No hidden layers or opaque decision rules.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🏞️</div>
+        <h3>Why Aggregate into Parks?</h3>
+        <ul>
+          <li>Turbines in the same park (<code>O1–O2</code> or <code>H1–H5</code>) feel <strong>&gt;96% identical wind</strong>.</li>
+          <li>Giving each turbine its own weight makes them fight and creates <strong>fake negative weights</strong>.</li>
+          <li>Park medians give clean <strong>~40% / ~40%</strong> weights and survive single-sensor dropouts.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🏆</div>
+        <h3>Better Than Other Models</h3>
+        <ul>
+          <li><strong>vs. LightGBM (450 Trees):</strong> Black box that fails seasonal shifts (<code>-20%</code> error) and can't be audited.</li>
+          <li><strong>vs. Raw OLS Regression:</strong> Suffers from negative collinear weights.</li>
+          <li><strong>Explainability is key</strong> for insurance sign-off.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="banner">
+      <span>💡 <strong>Example (Turbine T2):</strong> <code>v_T2 = 0.61 + 0.40·Speed_O + 0.41·Speed_H − 0.04·u_O + 0.04·v_O + 0.01·u_H − 0.08·v_H</code></span>
+      <strong>100% Transparent</strong>
+    </div>
+  </section>
+
+  <!-- ==================== SLIDE 3: NATIVE BAYESIAN UNCERTAINTIES ==================== -->
+  <section class="slide">
+    <div>
+      <div class="top-bar">
+        <span class="pill">Slide 3 · Native Uncertainty Quantification</span>
+        <span class="brand">BayWa r.e. Wind Challenge</span>
+      </div>
+      <h1>Native Bayesian Uncertainty: Two Bands, Zero Crossing</h1>
+      <p class="subtitle">Uncertainty comes directly from probability math — not ad-hoc quantile trees.</p>
+    </div>
+
+    <div class="grid-2">
+      <div class="card highlight">
+        <div class="card-icon">🎯</div>
+        <h3>Why Native Bayesian Beats Quantile Estimates</h3>
+        <ul>
+          <li><strong>Quantile Models (e.g. LightGBM):</strong> Train 3 separate models for <code>P10</code>, <code>P50</code>, and <code>P90</code>. Because they don't share math, <strong>curves can cross</strong> (<code>P10 &gt; P50</code>) and require manual patching.</li>
+          <li><strong>Native Bayesian Ridge:</strong> Predicts a complete bell curve (mean <code>μ</code> &amp; spread <code>σ</code>) at every 10-minute step.</li>
+          <li><strong>Guaranteed Consistency:</strong> Percentiles (<code>50%–99%</code> slider in our app) never cross and separate <strong>formula certainty</strong> from <strong>wind gusts</strong>.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">📊</div>
+        <h3>Two Uncertainties Separated Automatically</h3>
+        <ul>
+          <li><strong>1. 95% Coefficient CI (Dark Inner Band — ±2.0 MWh):</strong><br/>
+          <em>"How sure are we about our formula?"</em><br/>
+          With <code>12,400+</code> training intervals, the formula weights are pinned down extremely tightly.</li>
+          <li><strong>2. 80% Predictive Band P10–P90 (Light Outer Band):</strong><br/>
+          <em>"How gusty is a single 10-minute step?"</em><br/>
+          Over a 3-day outage, random 10-minute gusts cancel out — so true energy stays close to <strong>P50</strong>.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="banner">
+      <span>🛡️ <strong>Turbine T1 Outage Example:</strong> Central Estimate <strong>75.3 MWh</strong> · 95% Formula CI: <strong>73.3 – 77.4 MWh</strong> · 80% Gust Band: <strong>26.8 – 154.8 MWh</strong></span>
+      <strong>Calibrated at 82.7% (Target 80%)</strong>
+    </div>
+  </section>
+
+  <!-- ==================== SLIDE 4: CROSS-VALIDATION ACCURACY METRICS ==================== -->
+  <section class="slide">
+    <div>
+      <div class="top-bar">
+        <span class="pill">Slide 4 · Cross-Validated Accuracy</span>
+        <span class="brand">BayWa r.e. Wind Challenge</span>
+      </div>
+      <h1>Robust Accuracy via 5-Fold Cross-Validation</h1>
+      <p class="subtitle">Evaluated across all 86 operational days (12,421 intervals) without permanently withholding training data.</p>
+    </div>
+
+    <div class="kpi-row">
+      <div class="kpi-box">
+        <div class="kpi-lbl">5-Fold CV Wind Speed MAE</div>
+        <div class="kpi-val">0.88 – 0.99 m/s</div>
+      </div>
+      <div class="kpi-box">
+        <div class="kpi-lbl">5-Fold CV Power MAE</div>
+        <div class="kpi-val">440 – 493 kW</div>
+      </div>
+      <div class="kpi-box">
+        <div class="kpi-lbl">80% Band Coverage (P10–P90)</div>
+        <div class="kpi-val">82.4% – 83.0%</div>
+      </div>
+    </div>
+
+    <div class="card" style="padding: 1.25rem 1.6rem;">
+      <table class="clean-table">
+        <thead>
+          <tr>
+            <th>Target Turbine</th>
+            <th>5-Fold Wind MAE</th>
+            <th>5-Fold Wind RMSE</th>
+            <th>5-Fold Power MAE</th>
+            <th>80% Band Coverage</th>
+            <th>5-Fold Energy Error</th>
+            <th>72h Outage Loss (P50)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Turbine T1</strong></td>
+            <td>0.990 m/s</td>
+            <td>1.338 m/s</td>
+            <td>492.6 kW</td>
+            <td><span class="badge-good">82.4%</span></td>
+            <td>-12.78%</td>
+            <td><span class="badge-blue">75.32 MWh</span></td>
+          </tr>
+          <tr>
+            <td><strong>Turbine T2</strong></td>
+            <td><strong>0.880 m/s</strong></td>
+            <td><strong>1.182 m/s</strong></td>
+            <td>453.4 kW</td>
+            <td><span class="badge-good">82.8%</span></td>
+            <td><strong>-8.77%</strong></td>
+            <td><span class="badge-blue">117.16 MWh</span></td>
+          </tr>
+          <tr>
+            <td><strong>Turbine T3</strong></td>
+            <td>0.893 m/s</td>
+            <td>1.194 m/s</td>
+            <td><strong>440.2 kW</strong></td>
+            <td><span class="badge-good">83.0%</span></td>
+            <td>-11.35%</td>
+            <td><span class="badge-blue">91.46 MWh</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="banner">
+      <span>🔄 <strong>Why Background 5-Fold CV?</strong> Every time block is tested strictly out-of-sample, while the final outage model still trains on <strong>100% of available history</strong>.</span>
+      <strong>Zero Data Wasted</strong>
+    </div>
+  </section>
+
+  <!-- ==================== SLIDE 5: BONUS CHALLENGES & PHYSICS ==================== -->
+  <section class="slide">
+    <div>
+      <div class="top-bar">
+        <span class="pill">Slide 5 · Physics &amp; Bonus Features</span>
+        <span class="brand">BayWa r.e. Wind Challenge</span>
+      </div>
+      <h1>Physics Addons &amp; All 3 Bonus Challenges</h1>
+      <p class="subtitle">Going beyond wind speed with atmospheric physics, smart filtering, and instant claim emails.</p>
+    </div>
+
+    <div class="grid-3">
+      <div class="card highlight">
+        <div class="card-icon">🌡️</div>
+        <h3>1. Physics: Direction &amp; Air Density</h3>
+        <ul>
+          <li><strong>Wind Vectors (<code>u, v</code>):</strong> Fixes the <code>359° ↔ 1°</code> compass jump and captures hill &amp; wake sheltering.</li>
+          <li><strong>IEC 61400-12-1 Air Density:</strong> Uses live <strong>Temperature &amp; Pressure</strong> from Park H (<code>97.9%</code> match) to adjust blade push for cold dense vs. warm thin air.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🛰️</div>
+        <h3>2. Auto Reference Selection</h3>
+        <ul>
+          <li>Automatically scans all uploaded reference files (<code>O1–O2</code>, <code>H1–H5</code>).</li>
+          <li>Flags and removes any reference turbine that is offline during the outage.</li>
+          <li>Ranks turbines by correlation and shared training days.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">✉️</div>
+        <h3>3. One-Click Insurance Claim</h3>
+        <ul>
+          <li>Generates a clean, ready-to-send claim notice with outage times, reference turbines, <strong>Estimated MWh</strong>, and 5-Fold CV proof.</li>
+          <li>Includes an <strong>"Open in Default Mail App"</strong> button that pre-fills the email automatically.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="banner">
+      <span>🚀 <strong>Ready for Live Demo:</strong> Interactive Streamlit Web App with plain-English <code>?</code> guides, manual calendar pickers, and 10-minute certainty explorer.</span>
+      <strong>BayWa r.e. Ready</strong>
+    </div>
+  </section>
+
+</div>
+
+<!-- Navigation Controls -->
+<div class="nav-bar">
+  <button class="nav-btn" onclick="prevSlide()">← Prev</button>
+  <span class="slide-counter" id="counter">1 / 5</span>
+  <button class="nav-btn" onclick="nextSlide()">Next →</button>
+  <button class="nav-btn" onclick="toggleFullScreen()">⛶ Fullscreen</button>
+</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const counter = document.getElementById('counter');
+  let current = 0;
+
+  function showSlide(idx) {
+    slides[current].classList.remove('active');
+    current = (idx + slides.length) % slides.length;
+    slides[current].classList.add('active');
+    counter.textContent = (current + 1) + ' / ' + slides.length;
+  }
+  function nextSlide() { showSlide(current + 1); }
+  function prevSlide() { showSlide(current - 1); }
+  function toggleFullScreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+    } else {
+      document.exitFullscreen();
+    }
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); nextSlide(); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prevSlide(); }
+    if (e.key === 'f' || e.key === 'F') { toggleFullScreen(); }
+  });
+</script>
+</body>
+</html>
